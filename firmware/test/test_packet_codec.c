@@ -4,6 +4,7 @@
 
 #include "packet.h"
 #include "packet_codec.h"
+#include "command_protocol.h"
 #include "telemetry_protocol.h"
 #include "session.h"
 #include "replay.h"
@@ -215,6 +216,61 @@ static int test_gnss_parser(void) {
     return 0;
 }
 
+static int test_command_protocol(void) {
+    command_request_t request = {
+        .version = COMMAND_PAYLOAD_VERSION,
+        .command_id = 44,
+        .opcode = COMMAND_OPCODE_PING,
+        .flags = 0,
+        .arg_len = 0,
+    };
+    hope_packet_t command_packet;
+    uint8_t encoded[HOPE_MAX_PACKET_LEN];
+    hope_packet_t decoded_packet;
+    command_request_t decoded_request;
+
+    if (command_protocol_build_request_packet(&request, 2, 1, 0x12345678, 44, 99, &command_packet) != ESP_OK) {
+        printf("FAIL: command packet build failed\n");
+        return 1;
+    }
+    int encoded_len = packet_encode(&command_packet, encoded, sizeof(encoded));
+    if (encoded_len <= 0 || packet_decode(encoded, (size_t)encoded_len, &decoded_packet) != 0) {
+        printf("FAIL: command packet encode/decode failed\n");
+        return 1;
+    }
+    if (decoded_packet.type != HOPE_PACKET_TYPE_COMMAND ||
+        command_protocol_parse_request_payload(decoded_packet.payload, decoded_packet.payload_len, &decoded_request) != ESP_OK ||
+        decoded_request.command_id != 44 ||
+        decoded_request.opcode != COMMAND_OPCODE_PING ||
+        decoded_request.auth_key_id != 0) {
+        printf("FAIL: command request decode mismatch\n");
+        return 1;
+    }
+
+    command_ack_t ack = {
+        .version = COMMAND_PAYLOAD_VERSION,
+        .acked_type = HOPE_PACKET_TYPE_COMMAND,
+        .command_id = 44,
+        .status = COMMAND_ACK_STATUS_OK,
+        .detail_code = 0,
+        .message_len = 4,
+        .message = "pong",
+    };
+    hope_packet_t ack_packet;
+    command_ack_t decoded_ack;
+    if (command_protocol_build_ack_packet(&ack, 1, 2, 0x12345678, 45, 100, &ack_packet) != ESP_OK ||
+        command_protocol_parse_ack_payload(ack_packet.payload, ack_packet.payload_len, &decoded_ack) != ESP_OK ||
+        decoded_ack.command_id != 44 ||
+        decoded_ack.status != COMMAND_ACK_STATUS_OK ||
+        strcmp(decoded_ack.message, "pong") != 0) {
+        printf("FAIL: command ACK decode mismatch\n");
+        return 1;
+    }
+
+    printf("PASS: command protocol\n");
+    return 0;
+}
+
 int main(void) {
     int failures = 0;
 
@@ -223,6 +279,7 @@ int main(void) {
     failures += test_malformed_packet_rejection();
     failures += test_replay_protection();
     failures += test_gnss_parser();
+    failures += test_command_protocol();
 
     if (failures == 0) {
         printf("ALL TESTS PASS\n");

@@ -1,6 +1,7 @@
 idf_component_register(
     SRCS
         "config_store.c"
+        "counter_store.c"
         "log_store.c"
         "nvs_store.c"
     INCLUDE_DIRS "include"

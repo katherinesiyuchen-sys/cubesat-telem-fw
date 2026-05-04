@@ -19,6 +19,10 @@ void config_store_defaults(cubesat_runtime_config_t *config) {
     config->ground_id = CUBESAT_GROUND_ID;
     config->session_id = CUBESAT_DEMO_SESSION_ID;
     config->lora_frequency_hz = CUBESAT_LORA_FREQUENCY_HZ;
+    config->lora_spreading_factor = CUBESAT_LORA_SPREADING_FACTOR;
+    config->lora_bandwidth_hz = CUBESAT_LORA_BANDWIDTH_HZ;
+    config->lora_coding_rate = CUBESAT_LORA_CODING_RATE;
+    config->lora_tx_power_dbm = CUBESAT_LORA_TX_POWER_DBM;
     config->gnss_baudrate = CUBESAT_GNSS_BAUDRATE;
 }
 
@@ -37,7 +41,12 @@ esp_err_t config_store_load(cubesat_runtime_config_t *config) {
     if (err != ESP_OK) {
         return err;
     }
-    return len == sizeof(*config) ? ESP_OK : ESP_ERR_INVALID_SIZE;
+    if (len != sizeof(*config)) {
+        config_store_defaults(config);
+        return config_store_save(config);
+    }
+
+    return ESP_OK;
 }
 
 esp_err_t config_store_save(const cubesat_runtime_config_t *config) {

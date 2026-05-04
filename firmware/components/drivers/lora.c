@@ -19,13 +19,20 @@
 #define SX126X_CMD_SET_DIO_IRQ_PARAMS       0x08
 #define SX126X_CMD_CLEAR_IRQ_STATUS         0x02
 #define SX126X_CMD_GET_IRQ_STATUS           0x12
+#define SX126X_CMD_GET_RX_BUFFER_STATUS     0x13
 #define SX126X_CMD_WRITE_BUFFER             0x0E
+#define SX126X_CMD_READ_BUFFER              0x1E
 #define SX126X_CMD_SET_TX                   0x83
+#define SX126X_CMD_SET_RX                   0x82
 
 #define SX126X_PACKET_TYPE_LORA             0x01
 #define SX126X_STANDBY_RC                   0x00
 #define SX126X_IRQ_TX_DONE                  0x0001
+#define SX126X_IRQ_RX_DONE                  0x0002
+#define SX126X_IRQ_HEADER_ERROR             0x0010
+#define SX126X_IRQ_CRC_ERROR                0x0040
 #define SX126X_IRQ_TIMEOUT                  0x0200
+#define SX126X_IRQ_RADIO_EVENTS             (SX126X_IRQ_TX_DONE | SX126X_IRQ_RX_DONE | SX126X_IRQ_HEADER_ERROR | SX126X_IRQ_CRC_ERROR | SX126X_IRQ_TIMEOUT)
 
 static spi_device_handle_t s_spi = NULL;
 static lora_config_t s_config;
@@ -152,10 +159,10 @@ static esp_err_t configure_radio(void) {
     ESP_RETURN_ON_ERROR(write_command(SX126X_CMD_SET_MODULATION_PARAMS, modulation, sizeof(modulation)), "lora", "modulation failed");
 
     uint8_t irq[] = {
-        (uint8_t)((SX126X_IRQ_TX_DONE | SX126X_IRQ_TIMEOUT) >> 8),
-        (uint8_t)(SX126X_IRQ_TX_DONE | SX126X_IRQ_TIMEOUT),
-        (uint8_t)((SX126X_IRQ_TX_DONE | SX126X_IRQ_TIMEOUT) >> 8),
-        (uint8_t)(SX126X_IRQ_TX_DONE | SX126X_IRQ_TIMEOUT),
+        (uint8_t)(SX126X_IRQ_RADIO_EVENTS >> 8),
+        (uint8_t)SX126X_IRQ_RADIO_EVENTS,
+        (uint8_t)(SX126X_IRQ_RADIO_EVENTS >> 8),
+        (uint8_t)SX126X_IRQ_RADIO_EVENTS,
         0x00,
         0x00,
         0x00,
@@ -199,7 +206,7 @@ esp_err_t lora_init(const lora_config_t *config) {
         .sclk_io_num = s_config.pin_sclk,
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
-        .max_transfer_sz = 256,
+        .max_transfer_sz = 512,
     };
     esp_err_t bus_result = spi_bus_initialize(s_config.spi_host, &bus_cfg, SPI_DMA_CH_AUTO);
     if (bus_result != ESP_OK && bus_result != ESP_ERR_INVALID_STATE) {
@@ -227,9 +234,12 @@ esp_err_t lora_send(const uint8_t *payload, size_t len, uint32_t timeout_ms) {
         return ESP_ERR_INVALID_ARG;
     }
 
+    uint8_t standby[] = { SX126X_STANDBY_RC };
+    ESP_RETURN_ON_ERROR(write_command(SX126X_CMD_SET_STANDBY, standby, sizeof(standby)), "lora", "standby before tx failed");
+
     uint8_t clear_irq[] = {
-        (uint8_t)((SX126X_IRQ_TX_DONE | SX126X_IRQ_TIMEOUT) >> 8),
-        (uint8_t)(SX126X_IRQ_TX_DONE | SX126X_IRQ_TIMEOUT),
+        (uint8_t)(SX126X_IRQ_RADIO_EVENTS >> 8),
+        (uint8_t)SX126X_IRQ_RADIO_EVENTS,
     };
     ESP_RETURN_ON_ERROR(write_command(SX126X_CMD_CLEAR_IRQ_STATUS, clear_irq, sizeof(clear_irq)), "lora", "clear irq failed");
 
@@ -261,6 +271,8 @@ esp_err_t lora_send(const uint8_t *payload, size_t len, uint32_t timeout_ms) {
     int64_t deadline = esp_timer_get_time() + ((int64_t)timeout_ms * 1000);
     while (gpio_get_level(s_config.pin_dio1) == 0) {
         if (esp_timer_get_time() > deadline) {
+            (void)write_command(SX126X_CMD_SET_STANDBY, standby, sizeof(standby));
+            (void)write_command(SX126X_CMD_CLEAR_IRQ_STATUS, clear_irq, sizeof(clear_irq));
             return ESP_ERR_TIMEOUT;
         }
         vTaskDelay(pdMS_TO_TICKS(1));
@@ -279,5 +291,96 @@ esp_err_t lora_send(const uint8_t *payload, size_t len, uint32_t timeout_ms) {
         return ESP_FAIL;
     }
 
+    (void)write_command(SX126X_CMD_SET_STANDBY, standby, sizeof(standby));
+    return ESP_OK;
+}
+
+esp_err_t lora_receive(uint8_t *payload, size_t capacity, size_t *out_len, uint32_t timeout_ms) {
+    if (payload == NULL || out_len == NULL || capacity == 0 || capacity > 255 || s_spi == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    *out_len = 0;
+
+    uint8_t clear_irq[] = {
+        (uint8_t)(SX126X_IRQ_RADIO_EVENTS >> 8),
+        (uint8_t)SX126X_IRQ_RADIO_EVENTS,
+    };
+    uint8_t standby[] = { SX126X_STANDBY_RC };
+    ESP_RETURN_ON_ERROR(write_command(SX126X_CMD_SET_STANDBY, standby, sizeof(standby)), "lora", "standby before rx failed");
+    ESP_RETURN_ON_ERROR(write_command(SX126X_CMD_CLEAR_IRQ_STATUS, clear_irq, sizeof(clear_irq)), "lora", "clear irq before rx failed");
+
+    uint8_t packet_params[] = {
+        0x00,
+        0x0C,
+        0x00,
+        0xFF,
+        0x01,
+        0x00,
+    };
+    ESP_RETURN_ON_ERROR(write_command(SX126X_CMD_SET_PACKET_PARAMS, packet_params, sizeof(packet_params)), "lora", "rx packet params failed");
+
+    uint8_t rx_timeout[] = { 0xFF, 0xFF, 0xFF };
+    ESP_RETURN_ON_ERROR(write_command(SX126X_CMD_SET_RX, rx_timeout, sizeof(rx_timeout)), "lora", "set rx failed");
+
+    int64_t deadline = esp_timer_get_time() + ((int64_t)timeout_ms * 1000);
+    while (gpio_get_level(s_config.pin_dio1) == 0) {
+        if (esp_timer_get_time() > deadline) {
+            (void)write_command(SX126X_CMD_SET_STANDBY, standby, sizeof(standby));
+            (void)write_command(SX126X_CMD_CLEAR_IRQ_STATUS, clear_irq, sizeof(clear_irq));
+            return ESP_ERR_TIMEOUT;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+
+    uint8_t irq_status[2] = { 0 };
+    ESP_RETURN_ON_ERROR(read_command(SX126X_CMD_GET_IRQ_STATUS, irq_status, sizeof(irq_status)), "lora", "rx irq status failed");
+    uint16_t irq = ((uint16_t)irq_status[0] << 8) | irq_status[1];
+    ESP_RETURN_ON_ERROR(write_command(SX126X_CMD_CLEAR_IRQ_STATUS, clear_irq, sizeof(clear_irq)), "lora", "clear irq after rx failed");
+
+    if ((irq & SX126X_IRQ_TIMEOUT) != 0) {
+        (void)write_command(SX126X_CMD_SET_STANDBY, standby, sizeof(standby));
+        return ESP_ERR_TIMEOUT;
+    }
+    if ((irq & (SX126X_IRQ_HEADER_ERROR | SX126X_IRQ_CRC_ERROR)) != 0) {
+        (void)write_command(SX126X_CMD_SET_STANDBY, standby, sizeof(standby));
+        return ESP_ERR_INVALID_CRC;
+    }
+    if ((irq & SX126X_IRQ_RX_DONE) == 0) {
+        (void)write_command(SX126X_CMD_SET_STANDBY, standby, sizeof(standby));
+        return ESP_FAIL;
+    }
+
+    uint8_t rx_status[2] = { 0 };
+    ESP_RETURN_ON_ERROR(read_command(SX126X_CMD_GET_RX_BUFFER_STATUS, rx_status, sizeof(rx_status)), "lora", "rx buffer status failed");
+    uint8_t payload_len = rx_status[0];
+    uint8_t start_pointer = rx_status[1];
+
+    if (payload_len == 0) {
+        (void)write_command(SX126X_CMD_SET_STANDBY, standby, sizeof(standby));
+        return ESP_ERR_NOT_FOUND;
+    }
+    if (payload_len > capacity) {
+        (void)write_command(SX126X_CMD_SET_STANDBY, standby, sizeof(standby));
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    uint8_t tx[3 + 255] = { 0 };
+    uint8_t rx[3 + 255] = { 0 };
+    tx[0] = SX126X_CMD_READ_BUFFER;
+    tx[1] = start_pointer;
+    tx[2] = 0x00;
+
+    ESP_RETURN_ON_ERROR(wait_while_busy(1000), "lora", "busy before read buffer");
+    spi_transaction_t transaction = {
+        .length = 8 * (3 + payload_len),
+        .tx_buffer = tx,
+        .rx_buffer = rx,
+    };
+    ESP_RETURN_ON_ERROR(spi_device_transmit(s_spi, &transaction), "lora", "read buffer failed");
+
+    memcpy(payload, &rx[3], payload_len);
+    *out_len = payload_len;
+    (void)write_command(SX126X_CMD_SET_STANDBY, standby, sizeof(standby));
     return ESP_OK;
 }

@@ -20,6 +20,8 @@ bool packet_type_is_valid(uint8_t type) {
         case HOPE_PACKET_TYPE_ALERT:
         case HOPE_PACKET_TYPE_HANDSHAKE:
         case HOPE_PACKET_TYPE_ACK:
+        case HOPE_PACKET_TYPE_DIAGNOSTIC:
+        case HOPE_PACKET_TYPE_COMMAND:
             return true;
         default:
             return false;

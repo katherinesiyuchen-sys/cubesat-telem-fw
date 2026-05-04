@@ -9,6 +9,10 @@ typedef struct {
     uint16_t ground_id;
     uint32_t session_id;
     uint32_t lora_frequency_hz;
+    uint8_t lora_spreading_factor;
+    uint32_t lora_bandwidth_hz;
+    uint8_t lora_coding_rate;
+    int8_t lora_tx_power_dbm;
     uint32_t gnss_baudrate;
     uint32_t boot_count;
 } cubesat_runtime_config_t;

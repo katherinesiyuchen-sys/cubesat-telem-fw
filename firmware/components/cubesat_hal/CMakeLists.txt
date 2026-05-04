@@ -7,5 +7,5 @@ idf_component_register(
         "hal_uart.c"
         "hal_urat.c"
     INCLUDE_DIRS "include"
-    REQUIRES driver esp_driver_gpio esp_driver_i2c esp_driver_spi esp_driver_uart esp_timer
+    REQUIRES esp_driver_gpio esp_driver_i2c esp_driver_spi esp_driver_uart esp_timer
 )

@@ -54,6 +54,18 @@ Change the menuconfig values if your board uses different pins. The firmware
 prints the compiled pin map at boot so you can confirm the exact configuration
 in `idf.py monitor`.
 
+Radio settings live in the same menu:
+
+```text
+LoRa frequency in Hz
+LoRa spreading factor
+LoRa bandwidth in Hz
+LoRa coding rate register value
+LoRa TX power in dBm
+```
+
+Both the ESP32 and the RangePi radio must use the same settings.
+
 ## 4. Build, flash, monitor
 
 Find your ESP32 COM port in Device Manager, then run:
@@ -88,6 +100,31 @@ python -m groundstation.ui.mastercontrol_app --rangepi-port COM5 --baud 115200 -
 Replace `COM5` with your RangePi port. Leave off `--no-sim` if you want fake
 dashboard traffic and live RangePi packets together.
 
+For a lower-level serial bridge, run:
+
+```powershell
+python groundstation\tools\rangepi_receiver.py --port COM5 --interactive
+```
+
+Interactive bridge commands:
+
+```text
+cmd ping
+cmd selftest
+cmd downlink
+tx 010600020001...
+raw <device-specific serial command>
+```
+
+The bridge sends command packets using:
+
+```text
+TX <packet-hex>
+```
+
+Your RangePi radio process must treat that line as raw bytes to transmit over
+LoRa.
+
 ## 7. Production switch
 
 For the GNSS-only milestone, turn off the bench fallback:
@@ -101,3 +138,11 @@ Then disable:
 ```text
 CubeSat runtime -> Transmit bench telemetry when GNSS has no fix
 ```
+
+For wiring/debug only, enable:
+
+```text
+CubeSat runtime -> Run hardware bring-up diagnostics only
+```
+
+That mode loops the self-test path and does not start normal telemetry tasks.

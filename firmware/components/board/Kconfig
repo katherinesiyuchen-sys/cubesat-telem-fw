@@ -79,6 +79,29 @@ config CUBESAT_LORA_FREQUENCY_HZ
     range 100000000 1000000000
     default 915000000
 
+config CUBESAT_LORA_SPREADING_FACTOR
+    int "LoRa spreading factor"
+    range 5 12
+    default 7
+
+config CUBESAT_LORA_BANDWIDTH_HZ
+    int "LoRa bandwidth in Hz"
+    range 7800 500000
+    default 125000
+
+config CUBESAT_LORA_CODING_RATE
+    int "LoRa coding rate register value"
+    range 1 4
+    default 1
+    help
+        SX1262 LoRa coding-rate value. Use 1 for 4/5, 2 for 4/6, 3 for 4/7,
+        and 4 for 4/8.
+
+config CUBESAT_LORA_TX_POWER_DBM
+    int "LoRa TX power in dBm"
+    range -9 22
+    default 14
+
 config CUBESAT_GNSS_BAUDRATE
     int "GNSS UART baudrate"
     range 1200 921600

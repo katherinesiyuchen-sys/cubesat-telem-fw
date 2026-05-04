@@ -14,6 +14,8 @@ typedef enum {
     HOPE_PACKET_TYPE_ALERT     = 2,
     HOPE_PACKET_TYPE_HANDSHAKE = 3,
     HOPE_PACKET_TYPE_ACK       = 4,
+    HOPE_PACKET_TYPE_DIAGNOSTIC = 5,
+    HOPE_PACKET_TYPE_COMMAND   = 6,
 } hope_packet_type_t;
 
 typedef struct {

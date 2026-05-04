@@ -1,0 +1,13 @@
+# ESP-IDF generated output
+firmware/build/
+firmware/sdkconfig
+firmware/sdkconfig.old
+
+# Python runtime/cache output
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local editor and OS noise
+.DS_Store
+Thumbs.db

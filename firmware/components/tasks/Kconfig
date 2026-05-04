@@ -15,4 +15,12 @@ config CUBESAT_LOG_PACKET_HEX
         console. This is useful for comparing ESP32 output with RangePi serial
         packets.
 
+config CUBESAT_BRINGUP_ONLY
+    bool "Run hardware bring-up diagnostics only"
+    default n
+    help
+        Runs the pin/SPI/SX1262/GNSS/I2C/security/NVS diagnostic loop without
+        starting the normal telemetry tasks. Enable this while wiring a new
+        ESP32 board.
+
 endmenu

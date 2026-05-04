@@ -1,10 +1,18 @@
 import struct
 from dataclasses import dataclass
 
+from groundstation.models.command import build_ack_payload, build_command_payload
+from groundstation.models.diagnostic import build_diagnostic_payload
 from groundstation.models.telemetry import build_telemetry_payload
 
 HOPE_HEADER_FORMAT = ">BBHHIIIH"
 HOPE_HEADER_LEN = struct.calcsize(HOPE_HEADER_FORMAT)
+HOPE_PACKET_TYPE_TELEMETRY = 1
+HOPE_PACKET_TYPE_ALERT = 2
+HOPE_PACKET_TYPE_HANDSHAKE = 3
+HOPE_PACKET_TYPE_ACK = 4
+HOPE_PACKET_TYPE_DIAGNOSTIC = 5
+HOPE_PACKET_TYPE_COMMAND = 6
 
 @dataclass
 class HopePacket:
@@ -72,7 +80,7 @@ def encode_telemetry_packet(
     header = struct.pack(
         HOPE_HEADER_FORMAT,
         1,              # version
-        1,              # telemetry type
+        HOPE_PACKET_TYPE_TELEMETRY,
         1,              # src_id
         2,              # dst_id
         session_id,
@@ -93,3 +101,97 @@ def encode_fake_packet(counter: int = 1) -> bytes:
         fix_type=3,
         satellites=8,
     )
+
+
+def encode_diagnostic_packet(
+    *,
+    counter: int,
+    session_id: int = 0x12345678,
+    timestamp: int = 0,
+    src_id: int = 1,
+    dst_id: int = 2,
+    **payload_fields,
+) -> bytes:
+    payload = build_diagnostic_payload(**payload_fields)
+    header = struct.pack(
+        HOPE_HEADER_FORMAT,
+        1,
+        HOPE_PACKET_TYPE_DIAGNOSTIC,
+        src_id,
+        dst_id,
+        session_id,
+        counter,
+        timestamp,
+        len(payload),
+    )
+    return header + payload
+
+
+def encode_command_packet(
+    *,
+    command_id: int,
+    opcode: int,
+    counter: int | None = None,
+    flags: int = 0,
+    auth_key_id: int = 0,
+    auth_tag: bytes | None = None,
+    arg: bytes | str = b"",
+    session_id: int = 0x12345678,
+    timestamp: int = 0,
+    src_id: int = 2,
+    dst_id: int = 1,
+) -> bytes:
+    payload = build_command_payload(
+        command_id=command_id,
+        opcode=opcode,
+        flags=flags,
+        auth_key_id=auth_key_id,
+        auth_tag=auth_tag,
+        arg=arg,
+    )
+    header = struct.pack(
+        HOPE_HEADER_FORMAT,
+        1,
+        HOPE_PACKET_TYPE_COMMAND,
+        src_id,
+        dst_id,
+        session_id,
+        counter if counter is not None else command_id,
+        timestamp,
+        len(payload),
+    )
+    return header + payload
+
+
+def encode_ack_packet(
+    *,
+    command_id: int,
+    status: int,
+    counter: int,
+    acked_type: int = HOPE_PACKET_TYPE_COMMAND,
+    detail_code: int = 0,
+    message: bytes | str = b"",
+    session_id: int = 0x12345678,
+    timestamp: int = 0,
+    src_id: int = 1,
+    dst_id: int = 2,
+) -> bytes:
+    payload = build_ack_payload(
+        acked_type=acked_type,
+        command_id=command_id,
+        status=status,
+        detail_code=detail_code,
+        message=message,
+    )
+    header = struct.pack(
+        HOPE_HEADER_FORMAT,
+        1,
+        HOPE_PACKET_TYPE_ACK,
+        src_id,
+        dst_id,
+        session_id,
+        counter,
+        timestamp,
+        len(payload),
+    )
+    return header + payload

@@ -15,9 +15,11 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from groundstation.backend.event_engine import EventEngine
-from groundstation.backend.packet_parser import encode_telemetry_packet
+from groundstation.backend.packet_parser import encode_command_packet, encode_diagnostic_packet, encode_telemetry_packet
 from groundstation.backend.rangepi import parse_rangepi_line
 from groundstation.backend.serial_link import SerialLink
+from groundstation.models.command import ack_status_name, command_opcode_from_name, parse_ack_payload
+from groundstation.models.diagnostic import diagnostic_mask_names, diagnostic_status_name, parse_diagnostic_payload
 from groundstation.models.telemetry import parse_telemetry_payload
 
 
@@ -37,6 +39,10 @@ LINE = "#20262a"
 OSM_TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
 TILE_SIZE = 256
 HOPE_PACKET_TYPE_TELEMETRY = 1
+HOPE_PACKET_TYPE_ACK = 4
+HOPE_PACKET_TYPE_DIAGNOSTIC = 5
+HOPE_PACKET_TYPE_COMMAND = 6
+RANGEPI_COMMAND_MAX_ATTEMPTS = 3
 
 
 WORLD_POLYGONS = [
@@ -110,6 +116,8 @@ class CommandRecord:
     created_tick: int
     updated_tick: int
     detail: str
+    packet_counter: int = 0
+    attempts: int = 0
 
 
 @dataclass
@@ -168,6 +176,41 @@ class FirmwareApi:
         result["note"] = note
         result["satellite"] = sat
         return result
+
+    def submit_diagnostic(self, sat: Satellite) -> dict:
+        raw = encode_diagnostic_packet(
+            counter=sat.counter,
+            session_id=sat.session_id,
+            timestamp=int(time.time()),
+            boot_count=sat.boot_count,
+            warning_mask=0x0006,
+            i2c_devices_seen=1 if sat.node_role != "field-sensor" else 0,
+        )
+        result = self.engine.handle_raw_packet(raw)
+        result["diagnostic"] = parse_diagnostic_payload(result["packet"].payload)
+        result["satellite"] = sat
+        return result
+
+    def build_command(
+        self,
+        sat: Satellite,
+        command_id: int,
+        command_name: str,
+        *,
+        packet_counter: int | None = None,
+        arg: bytes | str = b"",
+    ) -> bytes:
+        opcode = command_opcode_from_name(command_name)
+        return encode_command_packet(
+            command_id=command_id,
+            opcode=opcode,
+            counter=packet_counter if packet_counter is not None else command_id,
+            session_id=sat.session_id,
+            timestamp=int(time.time()),
+            src_id=2,
+            dst_id=1,
+            arg=arg,
+        )
 
 
 class MastercontrolApp(tk.Tk):
@@ -844,6 +887,14 @@ class MastercontrolApp(tk.Tk):
             self._write_terminal(f"RANGEPI PARSE_ERROR {exc} raw={line[:80]!r}", "bad")
             return
 
+        if packet.packet_type == HOPE_PACKET_TYPE_ACK:
+            self._handle_ack_packet(packet, result)
+            return
+
+        if packet.packet_type == HOPE_PACKET_TYPE_DIAGNOSTIC:
+            self._handle_diagnostic_packet(packet, result, "rangepi-rx")
+            return
+
         if packet.packet_type != HOPE_PACKET_TYPE_TELEMETRY:
             status = "accepted" if result["accepted"] else "rejected"
             self._write_terminal(
@@ -885,7 +936,89 @@ class MastercontrolApp(tk.Tk):
 
         self._record_packet(sat, "rangepi-rx", packet.counter, packet.session_id, status)
 
-    def _hardware_node_for_packet(self, packet, telemetry) -> Satellite:
+    def _handle_diagnostic_packet(self, packet, result: dict, source: str) -> None:
+        try:
+            diagnostic = parse_diagnostic_payload(packet.payload)
+        except Exception as exc:
+            self._write_terminal(f"RANGEPI diagnostic decode failed: {exc}", "bad")
+            return
+
+        sat = self._hardware_node_for_packet(packet, None)
+        sat.counter = max(sat.counter, packet.counter)
+        sat.session_id = packet.session_id
+        sat.online = True
+        sat.command_state = "SELFTEST"
+        sat.crypto_state = f"SELFTEST {diagnostic_status_name(diagnostic.overall_status)}"
+        sat.boot_count = diagnostic.boot_count
+        sat.last_contact_tick = self.tick
+
+        status = "accepted" if result["accepted"] else "rejected"
+        state = diagnostic_status_name(diagnostic.overall_status)
+        warn = ",".join(diagnostic_mask_names(diagnostic.warning_mask)) or "none"
+        fail = ",".join(diagnostic_mask_names(diagnostic.failed_mask)) or "none"
+
+        if result["accepted"]:
+            sat.last_fault = "none" if diagnostic.failed_mask == 0 else f"selftest fail {fail}"
+            self._write_terminal(
+                f"SELFTEST RX {sat.name} {state} boot={diagnostic.boot_count} "
+                f"i2c_seen={diagnostic.i2c_devices_seen} warn={warn} fail={fail} "
+                f"session=0x{packet.session_id:08X}",
+                "info" if diagnostic.overall_status == 0 else "warn",
+            )
+            if diagnostic.failed_mask:
+                self._write_alert(f"{sat.name} self-test failed: {fail}", "bad")
+            elif diagnostic.warning_mask:
+                self._write_alert(f"{sat.name} self-test warning: {warn}", "warn")
+        else:
+            self.replay_rejects += 1
+            self._write_alert(f"{sat.name} diagnostic replay rejected counter={packet.counter}", "bad")
+
+        self._record_packet(sat, source, packet.counter, packet.session_id, status)
+
+    def _handle_ack_packet(self, packet, result: dict) -> None:
+        try:
+            ack = parse_ack_payload(packet.payload)
+        except Exception as exc:
+            self._write_terminal(f"RANGEPI ACK decode failed: {exc}", "bad")
+            return
+
+        sat = self._hardware_node_for_packet(packet, None)
+        sat.counter = max(sat.counter, packet.counter)
+        sat.session_id = packet.session_id
+        sat.online = True
+        sat.last_contact_tick = self.tick
+
+        record = next((cmd for cmd in self.command_queue if cmd.command_id == ack.command_id), None)
+        ack_name = ack_status_name(ack.status)
+        status = "accepted" if result["accepted"] else "rejected"
+
+        if not result["accepted"]:
+            self.replay_rejects += 1
+            self._write_alert(f"{sat.name} ACK replay rejected counter={packet.counter}", "bad")
+            self._record_packet(sat, "ack", packet.counter, packet.session_id, status)
+            return
+
+        if record is not None:
+            record.status = "acked" if ack.status == 0 else "rejected"
+            record.detail = ack.message or ack_name
+            record.updated_tick = self.tick
+            if ack.status == 0 and record.command in {"arm", "isolate", "connect", "downlink"}:
+                self._apply_node_command(sat, record.command)
+            elif ack.status == 0 and record.command == "rotate":
+                sat.crypto_state = "ROTATE RESERVED"
+            elif ack.status == 0:
+                sat.command_state = record.command.upper()
+            self._record_audit("command", sat.name, "groundstation", record.command, record.status)
+
+        self._write_terminal(
+            f"ACK RX {sat.name} cmd={ack.command_id} status={ack_name} "
+            f"detail={ack.detail_code} msg={ack.message or '-'}",
+            "info" if ack.status == 0 else "warn",
+        )
+        self._record_packet(sat, "ack", packet.counter, packet.session_id, status)
+        self._render_command_queue()
+
+    def _hardware_node_for_packet(self, packet, telemetry=None) -> Satellite:
         for sat in self.satellites:
             if sat.session_id == packet.session_id:
                 return sat
@@ -895,6 +1028,17 @@ class MastercontrolApp(tk.Tk):
             mapped = self._find_node(mapped_name)
             if mapped is not None:
                 return mapped
+
+        if telemetry is None:
+            latitude = 37.7749
+            longitude = -122.4194
+            temperature_c = 0.0
+            satellites_seen = 0
+        else:
+            latitude = telemetry.latitude
+            longitude = telemetry.longitude
+            temperature_c = telemetry.temperature_c
+            satellites_seen = telemetry.satellites
 
         index = len(self.satellites)
         node = Satellite(
@@ -907,12 +1051,12 @@ class MastercontrolApp(tk.Tk):
             "HARDWARE DOWNLINK",
             max(packet.counter, 1),
             76,
-            telemetry.satellites,
-            telemetry.temperature_c,
+            satellites_seen,
+            temperature_c,
             420,
             300,
-            telemetry.latitude,
-            telemetry.longitude,
+            latitude,
+            longitude,
             "rangepi-downlink",
             command_state="RANGEPI",
         )
@@ -942,6 +1086,65 @@ class MastercontrolApp(tk.Tk):
 
         self._record_audit("rangepi", "operator", "rangepi", command, "sent")
         self._write_command(f"rangepi> {command}", "info")
+
+    def _send_rangepi_packet(self, raw_packet: bytes, label: str) -> bool:
+        if not self.rangepi_port:
+            self._write_command("RangePi bridge is not configured; restart with --rangepi-port COMx", "bad")
+            return False
+
+        with self.rangepi_lock:
+            link = self.rangepi_link
+
+        if link is None:
+            self._write_command("RangePi bridge is not connected", "bad")
+            return False
+
+        command = f"TX {raw_packet.hex().upper()}"
+        try:
+            link.write_line(command)
+        except Exception as exc:
+            self._write_command(f"RangePi packet TX failed: {exc}", "bad")
+            return False
+
+        self._record_audit("rangepi", "groundstation", "lora", label, "sent")
+        self._write_command(f"rangepi-tx> {label} bytes={len(raw_packet)}", "info")
+        return True
+
+    def _send_hardware_command_packet(self, sat: Satellite, record: CommandRecord) -> bool:
+        if record.packet_counter == 0:
+            record.packet_counter = max(record.command_id, sat.counter + 1)
+        elif record.attempts > 0:
+            record.packet_counter = max(self.command_sequence, sat.counter + 1, record.packet_counter + 1)
+            self.command_sequence = record.packet_counter + 1
+
+        try:
+            raw_packet = self.api.build_command(
+                sat,
+                record.command_id,
+                record.command,
+                packet_counter=record.packet_counter,
+            )
+        except Exception as exc:
+            record.status = "failed"
+            record.detail = str(exc)
+            record.updated_tick = self.tick
+            self._write_command(f"command packet build failed: {exc}", "bad")
+            return False
+
+        if not self._send_rangepi_packet(raw_packet, f"cmd#{record.command_id}:{record.node_name}:{record.command}"):
+            record.status = "failed"
+            record.detail = "radio bridge unavailable"
+            record.updated_tick = self.tick
+            self._render_command_queue()
+            return False
+
+        record.attempts += 1
+        record.status = "sent"
+        record.detail = f"waiting for radio ACK attempt {record.attempts}/{RANGEPI_COMMAND_MAX_ATTEMPTS}"
+        record.updated_tick = self.tick
+        self._record_packet(sat, "cmd-tx", record.packet_counter, sat.session_id, "sent")
+        self._render_command_queue()
+        return True
 
     def _on_close(self) -> None:
         self.rangepi_running = False
@@ -1089,7 +1292,7 @@ class MastercontrolApp(tk.Tk):
 
         parts = command.lower().split()
         if parts[0] == "help":
-            self._write_command("commands: status | node | addnode <name> <role> | delnode <name> | pair pin|kem|manual | rangepi <raw-cmd> | arm | isolate | connect | downlink | rotate | ping | zoomin | zoomout | google | street | track <1-5> | replay | handoff | pause | schedule | sessions", "info")
+            self._write_command("commands: status | node | selftest | addnode <name> <role> | delnode <name> | pair pin|kem|manual | rangepi <raw-cmd> | arm | isolate | connect | downlink | rotate | ping | zoomin | zoomout | google | street | track <1-5> | replay | handoff | pause | schedule | sessions", "info")
         elif parts[0] == "status":
             sat = self.satellites[self.selected_index]
             self._write_command(
@@ -1099,6 +1302,8 @@ class MastercontrolApp(tk.Tk):
             )
         elif parts[0] in ("node", "arm", "isolate", "connect", "downlink", "rotate", "ping"):
             self._run_node_command(parts[0])
+        elif parts[0] in ("selftest", "diag", "diagnostic"):
+            self._run_selftest_command()
         elif parts[0] == "addnode":
             self._add_node_from_command(parts)
         elif parts[0] == "delnode":
@@ -1149,6 +1354,19 @@ class MastercontrolApp(tk.Tk):
 
         self._render_all()
 
+    def _run_selftest_command(self) -> None:
+        sat = self.satellites[self.selected_index]
+        if self.rangepi_port:
+            record = self._enqueue_command(sat, "selftest", "operator requested hardware self-test")
+            if self._send_hardware_command_packet(sat, record):
+                self._write_command("requested hardware self-test over framed LoRa command", "info")
+            return
+
+        result = self.api.submit_diagnostic(sat)
+        sat.counter += 1
+        self._handle_diagnostic_packet(result["packet"], result, "selftest-sim")
+        self._write_command("simulated self-test packet through parser/replay path", "info")
+
     def _apply_env_command(self, mode: str) -> None:
         if mode == "storm":
             self.env.radiation = 78
@@ -1178,7 +1396,12 @@ class MastercontrolApp(tk.Tk):
             )
             return
 
-        self._enqueue_command(sat, command, f"operator issued {command}")
+        record = self._enqueue_command(sat, command, f"operator issued {command}")
+        if self.rangepi_port:
+            if self._send_hardware_command_packet(sat, record):
+                self._write_command(f"{command} sent to {sat.name} over framed LoRa command", "info")
+            return
+
         self._write_command(f"{command} queued for {sat.name}", "info")
 
     def _apply_node_command(self, sat: Satellite, command: str) -> None:
@@ -1335,8 +1558,9 @@ class MastercontrolApp(tk.Tk):
         tk.Button(buttons, text="CANCEL", command=dialog.destroy, bg=PANEL, fg=TEXT, bd=0, highlightbackground="#1c2428", highlightthickness=1, padx=12, pady=8).pack(side="right")
 
     def _enqueue_command(self, sat: Satellite, command: str, detail: str) -> CommandRecord:
+        command_id = max(self.command_sequence, sat.counter + 1)
         record = CommandRecord(
-            command_id=self.command_sequence,
+            command_id=command_id,
             node_name=sat.name,
             command=command,
             status="queued",
@@ -1344,7 +1568,7 @@ class MastercontrolApp(tk.Tk):
             updated_tick=self.tick,
             detail=detail,
         )
-        self.command_sequence += 1
+        self.command_sequence = command_id + 1
         self.command_queue.append(record)
         self._record_audit("command", "operator", sat.name, command, "queued")
         self.ops_tabs.tab(self.queue_tab, text=f"QUEUE ({len([cmd for cmd in self.command_queue if cmd.status in {'queued', 'sent'}])})")
@@ -1359,6 +1583,22 @@ class MastercontrolApp(tk.Tk):
                 self._record_audit("command", "groundstation", record.node_name, record.command, "sent")
                 self._write_terminal(f"CMD#{record.command_id} sent {record.node_name}:{record.command}", "info")
             elif record.status == "sent" and self.tick - record.updated_tick >= 10:
+                if self.rangepi_port and record.detail.startswith("waiting for radio ACK"):
+                    node = self._find_node(record.node_name)
+                    if node is not None and record.attempts < RANGEPI_COMMAND_MAX_ATTEMPTS:
+                        self._write_alert(
+                            f"CMD#{record.command_id} retry {record.attempts + 1}/{RANGEPI_COMMAND_MAX_ATTEMPTS} for {record.node_name}",
+                            "warn",
+                        )
+                        self._send_hardware_command_packet(node, record)
+                        continue
+
+                    record.status = "timeout"
+                    record.detail = "radio ACK timeout"
+                    record.updated_tick = self.tick
+                    self._record_audit("command", "groundstation", record.node_name, record.command, "timeout")
+                    self._write_alert(f"CMD#{record.command_id} timeout waiting for RangePi ACK", "warn")
+                    continue
                 node = self._find_node(record.node_name)
                 if node is None:
                     record.status = "failed"

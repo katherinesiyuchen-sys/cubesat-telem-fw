@@ -12,6 +12,13 @@
 static gnss_config_t s_config;
 static bool s_initialized = false;
 
+static bool gnss_config_matches(const gnss_config_t *config) {
+    return s_config.uart_port == config->uart_port &&
+        s_config.pin_tx == config->pin_tx &&
+        s_config.pin_rx == config->pin_rx &&
+        s_config.baudrate == config->baudrate;
+}
+
 static int32_t coordinate_to_e7(const char *value, const char *hemisphere) {
     if (value == NULL || value[0] == '\0' || hemisphere == NULL) {
         return 0;
@@ -43,6 +50,10 @@ esp_err_t gnss_init(const gnss_config_t *config) {
         return ESP_ERR_INVALID_ARG;
     }
 
+    if (s_initialized) {
+        return gnss_config_matches(config) ? ESP_OK : ESP_ERR_INVALID_STATE;
+    }
+
     s_config = *config;
 
     uart_config_t uart_config = {
@@ -54,7 +65,10 @@ esp_err_t gnss_init(const gnss_config_t *config) {
         .source_clk = UART_SCLK_DEFAULT,
     };
 
-    ESP_RETURN_ON_ERROR(uart_driver_install(s_config.uart_port, 2048, 0, 0, NULL, 0), "gnss", "uart driver install failed");
+    esp_err_t install_result = uart_driver_install(s_config.uart_port, 2048, 0, 0, NULL, 0);
+    if (install_result != ESP_OK && install_result != ESP_ERR_INVALID_STATE) {
+        ESP_RETURN_ON_ERROR(install_result, "gnss", "uart driver install failed");
+    }
     ESP_RETURN_ON_ERROR(uart_param_config(s_config.uart_port, &uart_config), "gnss", "uart config failed");
     ESP_RETURN_ON_ERROR(
         uart_set_pin(s_config.uart_port, s_config.pin_tx, s_config.pin_rx, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE),

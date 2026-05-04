@@ -1,4 +1,6 @@
-from groundstation.backend.packet_parser import decode_packet, encode_fake_packet, encode_telemetry_packet
+from groundstation.backend.packet_parser import decode_packet, encode_ack_packet, encode_command_packet, encode_diagnostic_packet, encode_fake_packet, encode_telemetry_packet
+from groundstation.models.command import COMMAND_ACK_STATUS_OK, COMMAND_AUTH_TAG_LEN, COMMAND_OPCODE_PING, ack_status_name, parse_ack_payload, parse_command_payload
+from groundstation.models.diagnostic import diagnostic_mask_names, diagnostic_status_name, parse_diagnostic_payload
 from groundstation.models.telemetry import parse_telemetry_payload
 
 
@@ -54,9 +56,58 @@ def assert_custom_demo_packet() -> None:
     assert telemetry.satellites == 10
 
 
+def assert_diagnostic_packet() -> None:
+    raw = encode_diagnostic_packet(counter=22, boot_count=4, warning_mask=0x0006)
+    pkt = decode_packet(raw)
+    diagnostic = parse_diagnostic_payload(pkt.payload)
+
+    assert pkt.packet_type == 5
+    assert pkt.counter == 22
+    assert diagnostic.boot_count == 4
+    assert diagnostic_status_name(diagnostic.overall_status) == "WARN"
+    assert diagnostic.pins["lora_mosi"] == 23
+    assert "i2c-bus" in diagnostic_mask_names(diagnostic.warning_mask)
+    assert "gnss-uart" in diagnostic_mask_names(diagnostic.warning_mask)
+
+
+def assert_command_and_ack_packets() -> None:
+    raw_command = encode_command_packet(command_id=91, opcode=COMMAND_OPCODE_PING, session_id=0xA1B2C3D4)
+    command_pkt = decode_packet(raw_command)
+    command = parse_command_payload(command_pkt.payload)
+
+    assert command_pkt.packet_type == 6
+    assert command_pkt.src_id == 2
+    assert command_pkt.dst_id == 1
+    assert command_pkt.session_id == 0xA1B2C3D4
+    assert command_pkt.counter == 91
+    assert command.command_id == 91
+    assert command.opcode == COMMAND_OPCODE_PING
+    assert command.auth_key_id == 0
+    assert command.auth_tag == bytes(COMMAND_AUTH_TAG_LEN)
+
+    raw_ack = encode_ack_packet(
+        command_id=91,
+        status=COMMAND_ACK_STATUS_OK,
+        counter=42,
+        session_id=0xA1B2C3D4,
+        message="pong telemetry queued",
+    )
+    ack_pkt = decode_packet(raw_ack)
+    ack = parse_ack_payload(ack_pkt.payload)
+
+    assert ack_pkt.packet_type == 4
+    assert ack_pkt.src_id == 1
+    assert ack_pkt.dst_id == 2
+    assert ack.command_id == 91
+    assert ack_status_name(ack.status) == "ok"
+    assert ack.message == "pong telemetry queued"
+
+
 def main():
     assert_default_fake_packet()
     assert_custom_demo_packet()
+    assert_diagnostic_packet()
+    assert_command_and_ack_packets()
 
     print("PASS: packet parser")
 
