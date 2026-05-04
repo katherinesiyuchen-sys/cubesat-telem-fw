@@ -1,5 +1,10 @@
 idf_component_register(
-    SRCS "lora_task.c"
+    SRCS
+        "gnss_task.c"
+        "health_task.c"
+        "logger_task.c"
+        "lora_task.c"
+        "sensor_task.c"
     INCLUDE_DIRS "include"
-    REQUIRES comms security
+    REQUIRES app board comms drivers security storage utils esp_timer
 )

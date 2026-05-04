@@ -1,0 +1,18 @@
+menu "CubeSat runtime"
+
+config CUBESAT_FAKE_TELEMETRY_ON_GNSS_TIMEOUT
+    bool "Transmit bench telemetry when GNSS has no fix"
+    default y
+    help
+        Keeps the ESP32 demo runnable on a desk before the GNSS antenna has a
+        valid fix. Disable this for the real GNSS-only milestone.
+
+config CUBESAT_LOG_PACKET_HEX
+    bool "Log encoded packet bytes as TX_HEX"
+    default y
+    help
+        Prints each transmitted HOPE packet as a hex line on the ESP32 USB
+        console. This is useful for comparing ESP32 output with RangePi serial
+        packets.
+
+endmenu

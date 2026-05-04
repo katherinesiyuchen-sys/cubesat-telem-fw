@@ -1,0 +1,12 @@
+menu "CubeSat security"
+
+config CUBESAT_USE_LIBOQS
+    bool "Use liboqs for ML-KEM and ML-DSA"
+    default n
+    help
+        Enable this after adding liboqs as an ESP-IDF component named "oqs".
+        When disabled, the ML-KEM and ML-DSA APIs validate buffers but return
+        ESP_ERR_NOT_SUPPORTED so demo firmware does not falsely claim lattice
+        security.
+
+endmenu

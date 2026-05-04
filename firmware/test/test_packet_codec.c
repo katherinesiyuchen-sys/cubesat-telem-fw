@@ -7,6 +7,7 @@
 #include "telemetry_protocol.h"
 #include "session.h"
 #include "replay.h"
+#include "gnss.h"
 
 static int test_packet_encode_decode(void) {
     hope_packet_t original;
@@ -109,6 +110,28 @@ static int test_session_counter(void) {
     return 0;
 }
 
+static int test_malformed_packet_rejection(void) {
+    uint8_t short_header[HOPE_PACKET_HEADER_LEN - 1] = {0};
+    hope_packet_t decoded;
+
+    if (packet_decode(short_header, sizeof(short_header), &decoded) != -2) {
+        printf("FAIL: malformed packet short header accepted\n");
+        return 1;
+    }
+
+    uint8_t truncated_payload[HOPE_PACKET_HEADER_LEN + 1] = {0};
+    truncated_payload[18] = 0;
+    truncated_payload[19] = 2;
+
+    if (packet_decode(truncated_payload, sizeof(truncated_payload), &decoded) != -4) {
+        printf("FAIL: malformed packet truncated payload accepted\n");
+        return 1;
+    }
+
+    printf("PASS: malformed packet rejection\n");
+    return 0;
+}
+
 static int test_replay_protection(void) {
     replay_init();
 
@@ -137,7 +160,58 @@ static int test_replay_protection(void) {
         return 1;
     }
 
+    if (!replay_check_session_and_update(0xAABBCCDD, 1)) {
+        printf("FAIL: replay rejected fresh counter 1 on different session\n");
+        return 1;
+    }
+
+    if (replay_check_session_and_update(0xAABBCCDD, 1)) {
+        printf("FAIL: replay accepted duplicate counter on different session\n");
+        return 1;
+    }
+
     printf("PASS: replay protection\n");
+    return 0;
+}
+
+static int test_gnss_parser(void) {
+    gnss_fix_t fix;
+
+    const char *valid_gga = "$GNGGA,123519,3748.2900,N,12216.3800,W,1,08,0.9,10.0,M,0.0,M,,*47";
+    if (gnss_parse_sentence(valid_gga, &fix) != ESP_OK || !fix.valid) {
+        printf("FAIL: GNSS parser rejected valid GGA\n");
+        return 1;
+    }
+
+    if (fix.latitude_e7 != 378048333 || fix.longitude_e7 != -1222730000 || fix.satellites != 8) {
+        printf(
+            "FAIL: GNSS parser produced unexpected fix: lat=%ld lon=%ld sats=%u\n",
+            (long)fix.latitude_e7,
+            (long)fix.longitude_e7,
+            (unsigned)fix.satellites
+        );
+        return 1;
+    }
+
+    const char *no_fix_gga = "$GNGGA,123519,3748.2900,N,12216.3800,W,0,00,0.9,10.0,M,0.0,M,,*47";
+    if (gnss_parse_sentence(no_fix_gga, &fix) == ESP_OK) {
+        printf("FAIL: GNSS parser accepted no-fix GGA\n");
+        return 1;
+    }
+
+    const char *valid_rmc = "$GNRMC,123519,A,3748.2900,N,12216.3800,W,0.0,0.0,010126,,,A*68";
+    if (gnss_parse_sentence(valid_rmc, &fix) != ESP_OK || !fix.valid) {
+        printf("FAIL: GNSS parser rejected valid RMC\n");
+        return 1;
+    }
+
+    const char *no_fix_rmc = "$GNRMC,123519,V,3748.2900,N,12216.3800,W,0.0,0.0,010126,,,N*68";
+    if (gnss_parse_sentence(no_fix_rmc, &fix) == ESP_OK) {
+        printf("FAIL: GNSS parser accepted no-fix RMC\n");
+        return 1;
+    }
+
+    printf("PASS: GNSS parser\n");
     return 0;
 }
 
@@ -146,7 +220,9 @@ int main(void) {
 
     failures += test_packet_encode_decode();
     failures += test_session_counter();
+    failures += test_malformed_packet_rejection();
     failures += test_replay_protection();
+    failures += test_gnss_parser();
 
     if (failures == 0) {
         printf("ALL TESTS PASS\n");

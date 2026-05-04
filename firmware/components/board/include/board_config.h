@@ -1,0 +1,109 @@
+#pragma once
+
+// ESP32 DevKit-friendly defaults. Replace these with the actual PCB pins before
+// hardware tests. Preferred path: run `idf.py menuconfig` and edit
+// "CubeSat board pins"; the CONFIG_* values below will override these defaults.
+
+#include "sdkconfig.h"
+
+#ifdef CONFIG_CUBESAT_PIN_STATUS_LED
+#define PIN_STATUS_LED       CONFIG_CUBESAT_PIN_STATUS_LED
+#else
+#define PIN_STATUS_LED       2
+#endif
+
+#ifdef CONFIG_CUBESAT_PIN_LORA_MOSI
+#define PIN_LORA_MOSI        CONFIG_CUBESAT_PIN_LORA_MOSI
+#else
+#define PIN_LORA_MOSI        23
+#endif
+
+#ifdef CONFIG_CUBESAT_PIN_LORA_MISO
+#define PIN_LORA_MISO        CONFIG_CUBESAT_PIN_LORA_MISO
+#else
+#define PIN_LORA_MISO        19
+#endif
+
+#ifdef CONFIG_CUBESAT_PIN_LORA_SCLK
+#define PIN_LORA_SCLK        CONFIG_CUBESAT_PIN_LORA_SCLK
+#else
+#define PIN_LORA_SCLK        18
+#endif
+
+#ifdef CONFIG_CUBESAT_PIN_LORA_CS
+#define PIN_LORA_CS          CONFIG_CUBESAT_PIN_LORA_CS
+#else
+#define PIN_LORA_CS          5
+#endif
+
+#ifdef CONFIG_CUBESAT_PIN_LORA_RESET
+#define PIN_LORA_RESET       CONFIG_CUBESAT_PIN_LORA_RESET
+#else
+#define PIN_LORA_RESET       14
+#endif
+
+#ifdef CONFIG_CUBESAT_PIN_LORA_BUSY
+#define PIN_LORA_BUSY        CONFIG_CUBESAT_PIN_LORA_BUSY
+#else
+#define PIN_LORA_BUSY        27
+#endif
+
+#ifdef CONFIG_CUBESAT_PIN_LORA_DIO1
+#define PIN_LORA_DIO1        CONFIG_CUBESAT_PIN_LORA_DIO1
+#else
+#define PIN_LORA_DIO1        26
+#endif
+
+#ifdef CONFIG_CUBESAT_PIN_GNSS_TX
+#define PIN_GNSS_TX          CONFIG_CUBESAT_PIN_GNSS_TX
+#else
+#define PIN_GNSS_TX          17
+#endif
+
+#ifdef CONFIG_CUBESAT_PIN_GNSS_RX
+#define PIN_GNSS_RX          CONFIG_CUBESAT_PIN_GNSS_RX
+#else
+#define PIN_GNSS_RX          16
+#endif
+
+#ifdef CONFIG_CUBESAT_PIN_I2C_SDA
+#define PIN_I2C_SDA          CONFIG_CUBESAT_PIN_I2C_SDA
+#else
+#define PIN_I2C_SDA          21
+#endif
+
+#ifdef CONFIG_CUBESAT_PIN_I2C_SCL
+#define PIN_I2C_SCL          CONFIG_CUBESAT_PIN_I2C_SCL
+#else
+#define PIN_I2C_SCL          22
+#endif
+
+#ifdef CONFIG_CUBESAT_NODE_ID
+#define CUBESAT_NODE_ID              CONFIG_CUBESAT_NODE_ID
+#else
+#define CUBESAT_NODE_ID              1
+#endif
+
+#ifdef CONFIG_CUBESAT_GROUND_ID
+#define CUBESAT_GROUND_ID            CONFIG_CUBESAT_GROUND_ID
+#else
+#define CUBESAT_GROUND_ID            2
+#endif
+
+#ifdef CONFIG_CUBESAT_DEMO_SESSION_ID
+#define CUBESAT_DEMO_SESSION_ID      CONFIG_CUBESAT_DEMO_SESSION_ID
+#else
+#define CUBESAT_DEMO_SESSION_ID      0x12345678UL
+#endif
+
+#ifdef CONFIG_CUBESAT_LORA_FREQUENCY_HZ
+#define CUBESAT_LORA_FREQUENCY_HZ    CONFIG_CUBESAT_LORA_FREQUENCY_HZ
+#else
+#define CUBESAT_LORA_FREQUENCY_HZ    915000000UL
+#endif
+
+#ifdef CONFIG_CUBESAT_GNSS_BAUDRATE
+#define CUBESAT_GNSS_BAUDRATE        CONFIG_CUBESAT_GNSS_BAUDRATE
+#else
+#define CUBESAT_GNSS_BAUDRATE        9600
+#endif

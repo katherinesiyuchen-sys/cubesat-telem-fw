@@ -31,4 +31,6 @@ typedef struct {
     size_t   payload_len;
 } hope_packet_t;
 
-//basic packet encoding/decoding functions
+void packet_init(hope_packet_t *pkt, hope_packet_type_t type, uint16_t src_id, uint16_t dst_id);
+bool packet_type_is_valid(uint8_t type);
+bool packet_header_is_valid(const hope_packet_t *pkt);

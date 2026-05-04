@@ -1,0 +1,283 @@
+#include "loraq.h"
+
+#include <string.h>
+
+#include "driver/gpio.h"
+#include "esp_check.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#define SX126X_CMD_SET_STANDBY              0x80
+#define SX126X_CMD_SET_PACKET_TYPE          0x8A
+#define SX126X_CMD_SET_RF_FREQUENCY         0x86
+#define SX126X_CMD_SET_PA_CONFIG            0x95
+#define SX126X_CMD_SET_TX_PARAMS            0x8E
+#define SX126X_CMD_SET_BUFFER_BASE_ADDRESS  0x8F
+#define SX126X_CMD_SET_MODULATION_PARAMS    0x8B
+#define SX126X_CMD_SET_PACKET_PARAMS        0x8C
+#define SX126X_CMD_SET_DIO_IRQ_PARAMS       0x08
+#define SX126X_CMD_CLEAR_IRQ_STATUS         0x02
+#define SX126X_CMD_GET_IRQ_STATUS           0x12
+#define SX126X_CMD_WRITE_BUFFER             0x0E
+#define SX126X_CMD_SET_TX                   0x83
+
+#define SX126X_PACKET_TYPE_LORA             0x01
+#define SX126X_STANDBY_RC                   0x00
+#define SX126X_IRQ_TX_DONE                  0x0001
+#define SX126X_IRQ_TIMEOUT                  0x0200
+
+static spi_device_handle_t s_spi = NULL;
+static lora_config_t s_config;
+
+static esp_err_t wait_while_busy(uint32_t timeout_ms) {
+    int64_t deadline = esp_timer_get_time() + ((int64_t)timeout_ms * 1000);
+
+    while (gpio_get_level(s_config.pin_busy) != 0) {
+        if (esp_timer_get_time() > deadline) {
+            return ESP_ERR_TIMEOUT;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t write_command(uint8_t command, const uint8_t *data, size_t len) {
+    ESP_RETURN_ON_ERROR(wait_while_busy(1000), "lora", "SX1262 busy timeout");
+
+    uint8_t tx[1 + 16];
+    if (len > sizeof(tx) - 1) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    tx[0] = command;
+    if (len > 0) {
+        memcpy(&tx[1], data, len);
+    }
+
+    spi_transaction_t transaction = {
+        .length = 8 * (1 + len),
+        .tx_buffer = tx,
+    };
+
+    return spi_device_transmit(s_spi, &transaction);
+}
+
+static esp_err_t read_command(uint8_t command, uint8_t *out, size_t len) {
+    if (out == NULL || len == 0 || len > 16) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ESP_RETURN_ON_ERROR(wait_while_busy(1000), "lora", "SX1262 busy timeout");
+
+    uint8_t tx[2 + 16] = { 0 };
+    uint8_t rx[2 + 16] = { 0 };
+    tx[0] = command;
+    tx[1] = 0x00;
+
+    spi_transaction_t transaction = {
+        .length = 8 * (2 + len),
+        .tx_buffer = tx,
+        .rx_buffer = rx,
+    };
+
+    ESP_RETURN_ON_ERROR(spi_device_transmit(s_spi, &transaction), "lora", "read command failed");
+    memcpy(out, &rx[2], len);
+    return ESP_OK;
+}
+
+static uint8_t bandwidth_to_reg(uint32_t bandwidth_hz) {
+    if (bandwidth_hz <= 7800) {
+        return 0x00;
+    }
+    if (bandwidth_hz <= 10400) {
+        return 0x08;
+    }
+    if (bandwidth_hz <= 15600) {
+        return 0x01;
+    }
+    if (bandwidth_hz <= 20800) {
+        return 0x09;
+    }
+    if (bandwidth_hz <= 31250) {
+        return 0x02;
+    }
+    if (bandwidth_hz <= 41700) {
+        return 0x0A;
+    }
+    if (bandwidth_hz <= 62500) {
+        return 0x03;
+    }
+    if (bandwidth_hz <= 125000) {
+        return 0x04;
+    }
+    if (bandwidth_hz <= 250000) {
+        return 0x05;
+    }
+    return 0x06;
+}
+
+static esp_err_t configure_radio(void) {
+    uint8_t standby[] = { SX126X_STANDBY_RC };
+    ESP_RETURN_ON_ERROR(write_command(SX126X_CMD_SET_STANDBY, standby, sizeof(standby)), "lora", "standby failed");
+
+    uint8_t packet_type[] = { SX126X_PACKET_TYPE_LORA };
+    ESP_RETURN_ON_ERROR(write_command(SX126X_CMD_SET_PACKET_TYPE, packet_type, sizeof(packet_type)), "lora", "packet type failed");
+
+    uint32_t rf_freq = (uint32_t)(((uint64_t)s_config.frequency_hz << 25) / 32000000ULL);
+    uint8_t frequency[] = {
+        (uint8_t)(rf_freq >> 24),
+        (uint8_t)(rf_freq >> 16),
+        (uint8_t)(rf_freq >> 8),
+        (uint8_t)rf_freq,
+    };
+    ESP_RETURN_ON_ERROR(write_command(SX126X_CMD_SET_RF_FREQUENCY, frequency, sizeof(frequency)), "lora", "frequency failed");
+
+    uint8_t pa_config[] = { 0x04, 0x07, 0x00, 0x01 };
+    ESP_RETURN_ON_ERROR(write_command(SX126X_CMD_SET_PA_CONFIG, pa_config, sizeof(pa_config)), "lora", "pa config failed");
+
+    uint8_t tx_params[] = { (uint8_t)s_config.tx_power_dbm, 0x04 };
+    ESP_RETURN_ON_ERROR(write_command(SX126X_CMD_SET_TX_PARAMS, tx_params, sizeof(tx_params)), "lora", "tx params failed");
+
+    uint8_t buffer_base[] = { 0x00, 0x00 };
+    ESP_RETURN_ON_ERROR(write_command(SX126X_CMD_SET_BUFFER_BASE_ADDRESS, buffer_base, sizeof(buffer_base)), "lora", "buffer base failed");
+
+    uint8_t modulation[] = {
+        s_config.spreading_factor,
+        bandwidth_to_reg(s_config.bandwidth_hz),
+        s_config.coding_rate,
+        0x00,
+    };
+    ESP_RETURN_ON_ERROR(write_command(SX126X_CMD_SET_MODULATION_PARAMS, modulation, sizeof(modulation)), "lora", "modulation failed");
+
+    uint8_t irq[] = {
+        (uint8_t)((SX126X_IRQ_TX_DONE | SX126X_IRQ_TIMEOUT) >> 8),
+        (uint8_t)(SX126X_IRQ_TX_DONE | SX126X_IRQ_TIMEOUT),
+        (uint8_t)((SX126X_IRQ_TX_DONE | SX126X_IRQ_TIMEOUT) >> 8),
+        (uint8_t)(SX126X_IRQ_TX_DONE | SX126X_IRQ_TIMEOUT),
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+    };
+    return write_command(SX126X_CMD_SET_DIO_IRQ_PARAMS, irq, sizeof(irq));
+}
+
+esp_err_t lora_init(const lora_config_t *config) {
+    if (config == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (s_spi != NULL) {
+        return ESP_OK;
+    }
+
+    s_config = *config;
+
+    gpio_config_t output_cfg = {
+        .pin_bit_mask = (1ULL << s_config.pin_reset),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_RETURN_ON_ERROR(gpio_config(&output_cfg), "lora", "reset gpio failed");
+
+    gpio_config_t input_cfg = {
+        .pin_bit_mask = (1ULL << s_config.pin_busy) | (1ULL << s_config.pin_dio1),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_RETURN_ON_ERROR(gpio_config(&input_cfg), "lora", "input gpio failed");
+
+    spi_bus_config_t bus_cfg = {
+        .mosi_io_num = s_config.pin_mosi,
+        .miso_io_num = s_config.pin_miso,
+        .sclk_io_num = s_config.pin_sclk,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 256,
+    };
+    esp_err_t bus_result = spi_bus_initialize(s_config.spi_host, &bus_cfg, SPI_DMA_CH_AUTO);
+    if (bus_result != ESP_OK && bus_result != ESP_ERR_INVALID_STATE) {
+        return bus_result;
+    }
+
+    spi_device_interface_config_t dev_cfg = {
+        .clock_speed_hz = 8000000,
+        .mode = 0,
+        .spics_io_num = s_config.pin_cs,
+        .queue_size = 1,
+    };
+    ESP_RETURN_ON_ERROR(spi_bus_add_device(s_config.spi_host, &dev_cfg, &s_spi), "lora", "add spi device failed");
+
+    gpio_set_level(s_config.pin_reset, 0);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    gpio_set_level(s_config.pin_reset, 1);
+    vTaskDelay(pdMS_TO_TICKS(20));
+
+    return configure_radio();
+}
+
+esp_err_t lora_send(const uint8_t *payload, size_t len, uint32_t timeout_ms) {
+    if (payload == NULL || len == 0 || len > 255 || s_spi == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    uint8_t clear_irq[] = {
+        (uint8_t)((SX126X_IRQ_TX_DONE | SX126X_IRQ_TIMEOUT) >> 8),
+        (uint8_t)(SX126X_IRQ_TX_DONE | SX126X_IRQ_TIMEOUT),
+    };
+    ESP_RETURN_ON_ERROR(write_command(SX126X_CMD_CLEAR_IRQ_STATUS, clear_irq, sizeof(clear_irq)), "lora", "clear irq failed");
+
+    uint8_t packet_params[] = {
+        0x00,
+        0x0C,
+        0x00,
+        (uint8_t)len,
+        0x01,
+        0x00,
+    };
+    ESP_RETURN_ON_ERROR(write_command(SX126X_CMD_SET_PACKET_PARAMS, packet_params, sizeof(packet_params)), "lora", "packet params failed");
+
+    uint8_t tx[1 + 1 + 255];
+    tx[0] = SX126X_CMD_WRITE_BUFFER;
+    tx[1] = 0x00;
+    memcpy(&tx[2], payload, len);
+
+    ESP_RETURN_ON_ERROR(wait_while_busy(1000), "lora", "busy before write");
+    spi_transaction_t transaction = {
+        .length = 8 * (2 + len),
+        .tx_buffer = tx,
+    };
+    ESP_RETURN_ON_ERROR(spi_device_transmit(s_spi, &transaction), "lora", "write buffer failed");
+
+    uint8_t tx_timeout[] = { 0x00, 0x00, 0x00 };
+    ESP_RETURN_ON_ERROR(write_command(SX126X_CMD_SET_TX, tx_timeout, sizeof(tx_timeout)), "lora", "set tx failed");
+
+    int64_t deadline = esp_timer_get_time() + ((int64_t)timeout_ms * 1000);
+    while (gpio_get_level(s_config.pin_dio1) == 0) {
+        if (esp_timer_get_time() > deadline) {
+            return ESP_ERR_TIMEOUT;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+
+    uint8_t irq_status[2] = { 0 };
+    ESP_RETURN_ON_ERROR(read_command(SX126X_CMD_GET_IRQ_STATUS, irq_status, sizeof(irq_status)), "lora", "irq status failed");
+
+    uint16_t irq = ((uint16_t)irq_status[0] << 8) | irq_status[1];
+    ESP_RETURN_ON_ERROR(write_command(SX126X_CMD_CLEAR_IRQ_STATUS, clear_irq, sizeof(clear_irq)), "lora", "clear irq after tx failed");
+
+    if ((irq & SX126X_IRQ_TIMEOUT) != 0) {
+        return ESP_ERR_TIMEOUT;
+    }
+    if ((irq & SX126X_IRQ_TX_DONE) == 0) {
+        return ESP_FAIL;
+    }
+
+    return ESP_OK;
+}
