@@ -10,6 +10,7 @@
 #include "counter_store.h"
 #include "hardware_bringup.h"
 #include "health_task.h"
+#include "lattice_security.h"
 #include "logger_task.h"
 #include "log_store.h"
 #include "lora_task.h"
@@ -46,6 +47,13 @@ void app_main(void) {
         );
     } else {
         session_init(CUBESAT_DEMO_SESSION_ID);
+    }
+
+    esp_err_t lattice_result = lattice_security_init();
+    if (lattice_result == ESP_OK) {
+        ESP_LOGI(TAG, "Lattice security state: %s", lattice_security_state_name(lattice_security_state()));
+    } else {
+        ESP_LOGW(TAG, "Lattice security init failed: %s", esp_err_to_name(lattice_result));
     }
 
 #if defined(CONFIG_CUBESAT_BRINGUP_ONLY)

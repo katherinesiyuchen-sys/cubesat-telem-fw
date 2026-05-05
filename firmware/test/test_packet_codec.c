@@ -5,6 +5,7 @@
 #include "packet.h"
 #include "packet_codec.h"
 #include "command_protocol.h"
+#include "lattice_protocol.h"
 #include "telemetry_protocol.h"
 #include "session.h"
 #include "replay.h"
@@ -271,6 +272,67 @@ static int test_command_protocol(void) {
     return 0;
 }
 
+static int test_lattice_protocol(void) {
+    uint8_t object[800];
+    uint8_t payload[HOPE_MAX_PAYLOAD_LEN];
+    lattice_reassembly_t reassembly;
+
+    for (size_t i = 0; i < sizeof(object); ++i) {
+        object[i] = (uint8_t)((i * 17U) & 0xFFU);
+    }
+
+    uint16_t fragments = lattice_protocol_fragment_count(sizeof(object));
+    if (fragments <= 1) {
+        printf("FAIL: lattice fragment count too small\n");
+        return 1;
+    }
+
+    lattice_reassembly_reset(&reassembly);
+    for (uint16_t index = 0; index < fragments; ++index) {
+        size_t written = 0;
+        lattice_fragment_t fragment;
+        bool complete = false;
+
+        if (lattice_protocol_build_fragment_payload(
+                LATTICE_MSG_NODE_MLKEM_PUBLIC_KEY,
+                0x44,
+                index,
+                object,
+                sizeof(object),
+                payload,
+                sizeof(payload),
+                &written
+            ) != ESP_OK) {
+            printf("FAIL: lattice fragment build failed\n");
+            return 1;
+        }
+
+        if (lattice_protocol_parse_fragment_payload(payload, written, &fragment) != ESP_OK) {
+            printf("FAIL: lattice fragment parse failed\n");
+            return 1;
+        }
+
+        if (lattice_reassembly_add(&reassembly, &fragment, &complete) != ESP_OK) {
+            printf("FAIL: lattice fragment reassembly failed\n");
+            return 1;
+        }
+
+        if ((index + 1U == fragments) != complete) {
+            printf("FAIL: lattice completion state mismatch\n");
+            return 1;
+        }
+    }
+
+    if (lattice_reassembly_len(&reassembly) != sizeof(object) ||
+        memcmp(lattice_reassembly_data(&reassembly), object, sizeof(object)) != 0) {
+        printf("FAIL: lattice reassembled object mismatch\n");
+        return 1;
+    }
+
+    printf("PASS: lattice protocol\n");
+    return 0;
+}
+
 int main(void) {
     int failures = 0;
 
@@ -280,6 +342,7 @@ int main(void) {
     failures += test_replay_protection();
     failures += test_gnss_parser();
     failures += test_command_protocol();
+    failures += test_lattice_protocol();
 
     if (failures == 0) {
         printf("ALL TESTS PASS\n");

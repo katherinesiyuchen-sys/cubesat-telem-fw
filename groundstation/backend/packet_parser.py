@@ -1,8 +1,11 @@
+import hashlib
+import hmac
 import struct
 from dataclasses import dataclass
 
-from groundstation.models.command import build_ack_payload, build_command_payload
+from groundstation.models.command import COMMAND_AUTH_TAG_LEN, COMMAND_FLAG_AUTH_PRESENT, build_ack_payload, build_command_payload
 from groundstation.models.diagnostic import build_diagnostic_payload
+from groundstation.models.lattice import build_fragment_payload
 from groundstation.models.telemetry import build_telemetry_payload
 
 HOPE_HEADER_FORMAT = ">BBHHIIIH"
@@ -68,6 +71,8 @@ def encode_telemetry_packet(
     satellites: int = 8,
     session_id: int = 0x12345678,
     timestamp: int = 0,
+    src_id: int = 1,
+    dst_id: int = 2,
 ) -> bytes:
     payload = build_telemetry_payload(
         latitude=latitude,
@@ -81,8 +86,8 @@ def encode_telemetry_packet(
         HOPE_HEADER_FORMAT,
         1,              # version
         HOPE_PACKET_TYPE_TELEMETRY,
-        1,              # src_id
-        2,              # dst_id
+        src_id,
+        dst_id,
         session_id,
         counter,        # counter
         timestamp,
@@ -135,12 +140,19 @@ def encode_command_packet(
     flags: int = 0,
     auth_key_id: int = 0,
     auth_tag: bytes | None = None,
+    auth_key: bytes | None = None,
     arg: bytes | str = b"",
     session_id: int = 0x12345678,
     timestamp: int = 0,
     src_id: int = 2,
     dst_id: int = 1,
 ) -> bytes:
+    if auth_key is not None:
+        flags |= COMMAND_FLAG_AUTH_PRESENT
+        if auth_key_id == 0:
+            auth_key_id = 1
+        auth_tag = bytes(COMMAND_AUTH_TAG_LEN)
+
     payload = build_command_payload(
         command_id=command_id,
         opcode=opcode,
@@ -159,6 +171,19 @@ def encode_command_packet(
         counter if counter is not None else command_id,
         timestamp,
         len(payload),
+    )
+
+    if auth_key is None:
+        return header + payload
+
+    auth_tag = hmac.new(auth_key, header + payload, hashlib.sha256).digest()[:COMMAND_AUTH_TAG_LEN]
+    payload = build_command_payload(
+        command_id=command_id,
+        opcode=opcode,
+        flags=flags,
+        auth_key_id=auth_key_id,
+        auth_tag=auth_tag,
+        arg=arg,
     )
     return header + payload
 
@@ -187,6 +212,38 @@ def encode_ack_packet(
         HOPE_HEADER_FORMAT,
         1,
         HOPE_PACKET_TYPE_ACK,
+        src_id,
+        dst_id,
+        session_id,
+        counter,
+        timestamp,
+        len(payload),
+    )
+    return header + payload
+
+
+def encode_handshake_packet(
+    *,
+    message_type: int,
+    transfer_id: int,
+    fragment_index: int,
+    obj: bytes,
+    counter: int,
+    session_id: int = 0x12345678,
+    timestamp: int = 0,
+    src_id: int = 2,
+    dst_id: int = 1,
+) -> bytes:
+    payload = build_fragment_payload(
+        message_type=message_type,
+        transfer_id=transfer_id,
+        fragment_index=fragment_index,
+        obj=obj,
+    )
+    header = struct.pack(
+        HOPE_HEADER_FORMAT,
+        1,
+        HOPE_PACKET_TYPE_HANDSHAKE,
         src_id,
         dst_id,
         session_id,

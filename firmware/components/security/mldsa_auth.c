@@ -10,6 +10,9 @@
 #include <oqs/oqs.h>
 #endif
 
+// ML-DSA is used for full-size handshake signatures when liboqs is available.
+// Compact command authentication tags live in lattice_security.c and are HMACs
+// derived from the ML-KEM session secret.
 esp_err_t mldsa_auth_generate_keypair(
     uint8_t *public_key,
     size_t public_key_len,
@@ -44,6 +47,9 @@ esp_err_t mldsa_auth_generate_keypair(
 #endif
 }
 
+
+// Signs the given message with the provided secret key and writes a full
+// ML-DSA-44 signature to the output buffer.
 esp_err_t mldsa_auth_sign(
     const uint8_t *message,
     size_t message_len,

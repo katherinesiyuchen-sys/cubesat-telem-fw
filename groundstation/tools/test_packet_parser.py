@@ -1,5 +1,5 @@
 from groundstation.backend.packet_parser import decode_packet, encode_ack_packet, encode_command_packet, encode_diagnostic_packet, encode_fake_packet, encode_telemetry_packet
-from groundstation.models.command import COMMAND_ACK_STATUS_OK, COMMAND_AUTH_TAG_LEN, COMMAND_OPCODE_PING, ack_status_name, parse_ack_payload, parse_command_payload
+from groundstation.models.command import COMMAND_ACK_STATUS_OK, COMMAND_AUTH_TAG_LEN, COMMAND_FLAG_AUTH_PRESENT, COMMAND_OPCODE_PING, ack_status_name, parse_ack_payload, parse_command_payload
 from groundstation.models.diagnostic import diagnostic_mask_names, diagnostic_status_name, parse_diagnostic_payload
 from groundstation.models.telemetry import parse_telemetry_payload
 
@@ -84,6 +84,17 @@ def assert_command_and_ack_packets() -> None:
     assert command.opcode == COMMAND_OPCODE_PING
     assert command.auth_key_id == 0
     assert command.auth_tag == bytes(COMMAND_AUTH_TAG_LEN)
+
+    raw_auth_command = encode_command_packet(
+        command_id=92,
+        opcode=COMMAND_OPCODE_PING,
+        session_id=0xA1B2C3D4,
+        auth_key=bytes(range(32)),
+    )
+    auth_command = parse_command_payload(decode_packet(raw_auth_command).payload)
+    assert auth_command.flags & COMMAND_FLAG_AUTH_PRESENT
+    assert auth_command.auth_key_id == 1
+    assert auth_command.auth_tag != bytes(COMMAND_AUTH_TAG_LEN)
 
     raw_ack = encode_ack_packet(
         command_id=91,

@@ -100,6 +100,16 @@ python -m groundstation.ui.mastercontrol_app --rangepi-port COM5 --baud 115200 -
 Replace `COM5` with your RangePi port. Leave off `--no-sim` if you want fake
 dashboard traffic and live RangePi packets together.
 
+Without hardware, run the dashboard against the bridge simulator:
+
+```powershell
+python -m groundstation.ui.mastercontrol_app --rangepi-port sim://cubesat --no-sim
+```
+
+Then use the dashboard terminal commands such as `ping`, `selftest`, and
+`downlink`; the simulator replies with real ACK/telemetry/diagnostic packets
+through the same parser path.
+
 For a lower-level serial bridge, run:
 
 ```powershell
@@ -146,3 +156,57 @@ CubeSat runtime -> Run hardware bring-up diagnostics only
 ```
 
 That mode loops the self-test path and does not start normal telemetry tasks.
+
+## 8. Lattice security switch
+
+The default build keeps lattice crypto disabled so the firmware builds without a
+third-party PQC component:
+
+```text
+CubeSat security -> Use liboqs for ML-KEM and ML-DSA = n
+```
+
+After adding liboqs as an ESP-IDF component named `oqs`, enable:
+
+```text
+CubeSat security -> Use liboqs for ML-KEM and ML-DSA = y
+```
+
+For early radio testing, leave command auth optional. Once pairing works and
+the groundstation is sending authenticated commands, enable:
+
+```text
+CubeSat security -> Require lattice-derived command authentication = y
+```
+
+The dashboard/simulator can exercise the lattice handshake packet path now:
+
+```powershell
+python -m groundstation.ui.mastercontrol_app --rangepi-port sim://cubesat --no-sim
+```
+
+Then run `rotate` in the app terminal. The simulator emits fragmented
+`HOPE_PACKET_TYPE_HANDSHAKE` packets for the node ML-KEM and ML-DSA public keys,
+which should show up as `RANGEPI LATTICE ... fragment x/y` lines.
+
+## 9. PC-side post-quantum groundstation
+
+The groundstation can run real ML-KEM/ML-DSA on your PC before the ESP32 has a
+liboqs component installed:
+
+```powershell
+cd C:\Users\alexa\cubeSat_firmware
+python -m pip install --user -r groundstation\requirements-pq.txt
+powershell -ExecutionPolicy Bypass -File groundstation\tools\install_liboqs_windows.ps1
+```
+
+Then start the dashboard as usual. On boot it prints:
+
+```text
+PQ lattice backend: PC liboqs ready
+```
+
+When firmware lattice mode is later enabled and the ESP32 sends a signed node
+handshake, the dashboard verifies the node signature, sends the ground ML-KEM
+ciphertext and ML-DSA signature back over RangePi, and starts sending
+authenticated command packets for the new session.

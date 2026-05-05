@@ -9,4 +9,14 @@ config CUBESAT_USE_LIBOQS
         ESP_ERR_NOT_SUPPORTED so demo firmware does not falsely claim lattice
         security.
 
+config CUBESAT_REQUIRE_COMMAND_AUTH
+    bool "Require lattice-derived command authentication"
+    default n
+    depends on CUBESAT_USE_LIBOQS
+    help
+        Reject command packets unless COMMAND_FLAG_AUTH_PRESENT is set and the
+        tag verifies with keys derived from an established ML-KEM session.
+        Leave this disabled for first radio bring-up so unauthenticated ping
+        and self-test commands still work before pairing.
+
 endmenu

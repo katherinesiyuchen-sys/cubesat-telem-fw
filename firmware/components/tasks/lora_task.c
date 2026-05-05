@@ -6,6 +6,8 @@
 #include "counter_store.h"
 #include "diagnostic_protocol.h"
 #include "gnss.h"
+#include "lattice_protocol.h"
+#include "lattice_security.h"
 #include "loraq.h"
 #include "packet_codec.h"
 #include "replay.h"
@@ -18,6 +20,7 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "esp_check.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -67,6 +70,15 @@
 
 static const char *TAG = "lora_task";
 static uint32_t s_command_history[COMMAND_HISTORY_SLOTS];
+static lattice_reassembly_t s_lattice_rx;
+static uint8_t s_lattice_mlkem_public_key[MLKEM512_PUBLIC_KEY_LEN];
+static uint8_t s_lattice_mldsa_public_key[MLDSA44_PUBLIC_KEY_LEN];
+static uint8_t s_lattice_mldsa_signature[MLDSA44_SIGNATURE_LEN];
+static uint8_t s_ground_mldsa_public_key[MLDSA44_PUBLIC_KEY_LEN];
+static uint8_t s_ground_mlkem_ciphertext[MLKEM512_CIPHERTEXT_LEN];
+static uint16_t s_ground_mlkem_transfer_id;
+static bool s_ground_mldsa_public_key_valid;
+static bool s_ground_mlkem_ciphertext_valid;
 
 static bool command_history_contains(uint32_t command_id) {
     for (size_t i = 0; i < COMMAND_HISTORY_SLOTS; ++i) {
@@ -192,6 +204,124 @@ static esp_err_t send_command_ack(
     return tx_result;
 }
 
+static esp_err_t send_lattice_object(
+    uint8_t message_type,
+    uint16_t transfer_id,
+    const uint8_t *object,
+    size_t object_len,
+    uint16_t dst_id
+) {
+    if (object == NULL || object_len == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    uint16_t fragments = lattice_protocol_fragment_count(object_len);
+    if (fragments == 0) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    for (uint16_t index = 0; index < fragments; ++index) {
+        hope_packet_t packet;
+        esp_err_t build_result = lattice_protocol_build_fragment_packet(
+            message_type,
+            transfer_id,
+            index,
+            object,
+            object_len,
+            CUBESAT_NODE_ID,
+            dst_id,
+            session_get_id(),
+            session_next_counter(),
+            (uint32_t)(esp_timer_get_time() / 1000000ULL),
+            &packet
+        );
+        if (build_result != ESP_OK) {
+            return build_result;
+        }
+
+        uint8_t encoded[HOPE_MAX_PACKET_LEN];
+        int encoded_len = packet_encode(&packet, encoded, sizeof(encoded));
+        if (encoded_len <= 0) {
+            return ESP_FAIL;
+        }
+
+        log_packet_hex(encoded, (size_t)encoded_len);
+        esp_err_t tx_result = lora_send(encoded, (size_t)encoded_len, LORA_TX_TIMEOUT_MS);
+        if (tx_result != ESP_OK) {
+            return tx_result;
+        }
+        (void)counter_store_save_tx(packet.session_id, packet.counter);
+    }
+
+    ESP_LOGI(TAG, "TX lattice %s fragments=%u transfer=%u",
+        lattice_protocol_message_name(message_type),
+        (unsigned)fragments,
+        (unsigned)transfer_id
+    );
+    return ESP_OK;
+}
+
+static esp_err_t send_lattice_identity(uint16_t dst_id, uint16_t transfer_id) {
+    esp_err_t key_result = lattice_security_get_node_public_keys(
+        s_lattice_mlkem_public_key,
+        sizeof(s_lattice_mlkem_public_key),
+        s_lattice_mldsa_public_key,
+        sizeof(s_lattice_mldsa_public_key)
+    );
+    if (key_result != ESP_OK) {
+        ESP_LOGW(TAG, "Lattice identity unavailable: %s", esp_err_to_name(key_result));
+        return key_result;
+    }
+
+    ESP_RETURN_ON_ERROR(
+        send_lattice_object(
+            LATTICE_MSG_NODE_MLKEM_PUBLIC_KEY,
+            transfer_id,
+            s_lattice_mlkem_public_key,
+            sizeof(s_lattice_mlkem_public_key),
+            dst_id
+        ),
+        TAG,
+        "ML-KEM public key TX failed"
+    );
+
+    ESP_RETURN_ON_ERROR(
+        send_lattice_object(
+            LATTICE_MSG_NODE_MLDSA_PUBLIC_KEY,
+            transfer_id,
+            s_lattice_mldsa_public_key,
+            sizeof(s_lattice_mldsa_public_key),
+            dst_id
+        ),
+        TAG,
+        "ML-DSA public key TX failed"
+    );
+
+    ESP_RETURN_ON_ERROR(
+        lattice_security_sign_handshake(
+            LATTICE_SECURITY_TRANSCRIPT_ROLE_NODE_IDENTITY,
+            transfer_id,
+            session_get_id(),
+            s_lattice_mlkem_public_key,
+            sizeof(s_lattice_mlkem_public_key),
+            s_lattice_mldsa_public_key,
+            sizeof(s_lattice_mldsa_public_key),
+            s_lattice_mldsa_signature,
+            sizeof(s_lattice_mldsa_signature)
+        ),
+        TAG,
+        "node handshake signature failed"
+    );
+
+    return send_lattice_object(
+        LATTICE_MSG_NODE_HANDSHAKE_SIGNATURE,
+        transfer_id,
+        s_lattice_mldsa_signature,
+        sizeof(s_lattice_mldsa_signature),
+        dst_id
+    );
+}
+
 static esp_err_t transmit_telemetry_from_fix(const gnss_fix_t *fix, bool bench_fix) {
     if (fix == NULL) {
         return ESP_ERR_INVALID_ARG;
@@ -254,6 +384,139 @@ static bool command_packet_is_for_this_node(const hope_packet_t *packet) {
     return packet->dst_id == CUBESAT_NODE_ID || packet->dst_id == 0xFFFF;
 }
 
+static esp_err_t handle_lattice_object(uint8_t message_type, uint16_t transfer_id, const uint8_t *data, size_t len) {
+    if (data == NULL || len == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    switch ((lattice_message_type_t)message_type) {
+        case LATTICE_MSG_GROUND_MLKEM_CIPHERTEXT: {
+            uint32_t new_session_id = 0;
+            esp_err_t err = lattice_security_accept_mlkem_ciphertext(data, len, &new_session_id);
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "ML-KEM ciphertext rejected: %s", esp_err_to_name(err));
+                return err;
+            }
+
+            session_init(new_session_id);
+            replay_init();
+            (void)counter_store_save_tx(new_session_id, 0);
+            (void)counter_store_save_rx(new_session_id, 0);
+            if (len == sizeof(s_ground_mlkem_ciphertext)) {
+                memcpy(s_ground_mlkem_ciphertext, data, len);
+                s_ground_mlkem_transfer_id = transfer_id;
+                s_ground_mlkem_ciphertext_valid = true;
+            }
+            ESP_LOGI(TAG, "ML-KEM session established session=0x%08lX", (unsigned long)new_session_id);
+            return ESP_OK;
+        }
+        case LATTICE_MSG_GROUND_MLDSA_PUBLIC_KEY:
+            if (len != sizeof(s_ground_mldsa_public_key)) {
+                ESP_LOGW(TAG, "Ground ML-DSA public key invalid len=%u", (unsigned)len);
+                return ESP_ERR_INVALID_SIZE;
+            }
+            memcpy(s_ground_mldsa_public_key, data, len);
+            s_ground_mldsa_public_key_valid = true;
+            ESP_LOGI(TAG, "Ground ML-DSA public key received len=%u", (unsigned)len);
+            return ESP_OK;
+        case LATTICE_MSG_GROUND_HANDSHAKE_SIGNATURE: {
+            if (len != MLDSA44_SIGNATURE_LEN) {
+                return ESP_ERR_INVALID_SIZE;
+            }
+            if (!s_ground_mldsa_public_key_valid || !s_ground_mlkem_ciphertext_valid) {
+                ESP_LOGW(TAG, "Ground signature received before public key/ciphertext");
+                return ESP_ERR_INVALID_STATE;
+            }
+            if (transfer_id != s_ground_mlkem_transfer_id) {
+                ESP_LOGW(TAG, "Ground signature transfer mismatch sig=%u kem=%u",
+                    (unsigned)transfer_id,
+                    (unsigned)s_ground_mlkem_transfer_id
+                );
+                return ESP_ERR_INVALID_STATE;
+            }
+
+            esp_err_t verify_result = lattice_security_verify_handshake(
+                LATTICE_SECURITY_TRANSCRIPT_ROLE_GROUND_SESSION,
+                transfer_id,
+                session_get_id(),
+                s_ground_mlkem_ciphertext,
+                sizeof(s_ground_mlkem_ciphertext),
+                NULL,
+                0,
+                s_ground_mldsa_public_key,
+                sizeof(s_ground_mldsa_public_key),
+                data,
+                len
+            );
+            if (verify_result != ESP_OK) {
+                ESP_LOGW(TAG, "Ground handshake signature rejected: %s", esp_err_to_name(verify_result));
+                return verify_result;
+            }
+
+            ESP_LOGI(TAG, "Ground handshake signature verified transfer=%u", (unsigned)transfer_id);
+            return ESP_OK;
+        }
+        case LATTICE_MSG_SESSION_CONFIRM:
+            ESP_LOGI(TAG, "Lattice session confirm received len=%u", (unsigned)len);
+            return ESP_OK;
+        default:
+            ESP_LOGI(TAG, "Lattice message %s received len=%u",
+                lattice_protocol_message_name(message_type),
+                (unsigned)len
+            );
+            return ESP_OK;
+    }
+}
+
+static esp_err_t handle_handshake_packet(const hope_packet_t *packet) {
+    if (packet == NULL || packet->type != HOPE_PACKET_TYPE_HANDSHAKE) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!command_packet_is_for_this_node(packet)) {
+        ESP_LOGD(TAG, "Ignoring handshake for dst=%u", (unsigned)packet->dst_id);
+        return ESP_OK;
+    }
+
+    lattice_fragment_t fragment;
+    esp_err_t parse_result = lattice_protocol_parse_fragment_payload(packet->payload, packet->payload_len, &fragment);
+    if (parse_result != ESP_OK) {
+        ESP_LOGW(TAG, "Handshake fragment rejected: %s", esp_err_to_name(parse_result));
+        return parse_result;
+    }
+
+    bool complete = false;
+    esp_err_t add_result = lattice_reassembly_add(&s_lattice_rx, &fragment, &complete);
+    if (add_result != ESP_OK) {
+        ESP_LOGW(TAG, "Handshake reassembly failed: %s", esp_err_to_name(add_result));
+        return add_result;
+    }
+
+    ESP_LOGI(TAG, "RX lattice %s fragment=%u/%u transfer=%u",
+        lattice_protocol_message_name(fragment.message_type),
+        (unsigned)(fragment.fragment_index + 1U),
+        (unsigned)fragment.fragment_count,
+        (unsigned)fragment.transfer_id
+    );
+
+    if (!complete) {
+        return ESP_OK;
+    }
+
+    const uint8_t *data = lattice_reassembly_data(&s_lattice_rx);
+    size_t len = lattice_reassembly_len(&s_lattice_rx);
+    uint8_t message_type = lattice_reassembly_message_type(&s_lattice_rx);
+    ESP_LOGI(TAG, "RX lattice %s complete bytes=%u transfer=%u",
+        lattice_protocol_message_name(message_type),
+        (unsigned)len,
+        (unsigned)lattice_reassembly_transfer_id(&s_lattice_rx)
+    );
+
+    uint16_t transfer_id = lattice_reassembly_transfer_id(&s_lattice_rx);
+    esp_err_t result = handle_lattice_object(message_type, transfer_id, data, len);
+    lattice_reassembly_reset(&s_lattice_rx);
+    return result;
+}
+
 static esp_err_t handle_command_packet(
     const hope_packet_t *packet,
     bool *telemetry_paused,
@@ -289,6 +552,15 @@ static esp_err_t handle_command_packet(
         return parse_result;
     }
 
+    esp_err_t auth_result = lattice_security_verify_command(packet, &request);
+    if (auth_result != ESP_OK) {
+        ESP_LOGW(TAG, "Command auth rejected id=%lu: %s",
+            (unsigned long)request.command_id,
+            esp_err_to_name(auth_result)
+        );
+        return send_command_ack(packet, &request, COMMAND_ACK_STATUS_REJECTED, auth_result, "auth rejected");
+    }
+
     if (command_history_contains(request.command_id)) {
         ESP_LOGI(TAG, "Duplicate command id=%lu; sending cached-success ACK",
             (unsigned long)request.command_id
@@ -298,6 +570,7 @@ static esp_err_t handle_command_packet(
 
     const char *message = "accepted";
     bool run_self_test = false;
+    bool advertise_lattice_identity = false;
 
     switch ((command_opcode_t)request.opcode) {
         case COMMAND_OPCODE_SELF_TEST:
@@ -324,7 +597,8 @@ static esp_err_t handle_command_packet(
             message = "telemetry resumed";
             break;
         case COMMAND_OPCODE_ROTATE_SESSION:
-            message = "session rotation reserved";
+            advertise_lattice_identity = true;
+            message = lattice_security_backend_enabled() ? "lattice identity queued" : "lattice backend unavailable";
             break;
         case COMMAND_OPCODE_OPEN_DOWNLINK:
             *telemetry_paused = false;
@@ -348,7 +622,7 @@ static esp_err_t handle_command_packet(
     );
 
     if ((request.flags & COMMAND_FLAG_AUTH_PRESENT) != 0) {
-        ESP_LOGI(TAG, "Command id=%lu carries auth placeholder key=%u",
+        ESP_LOGI(TAG, "Command id=%lu lattice auth verified key=%u",
             (unsigned long)request.command_id,
             (unsigned)request.auth_key_id
         );
@@ -375,6 +649,13 @@ static esp_err_t handle_command_packet(
         }
     }
 
+    if (advertise_lattice_identity) {
+        esp_err_t identity_result = send_lattice_identity(packet->src_id, (uint16_t)(request.command_id & 0xFFFFU));
+        if (identity_result != ESP_OK) {
+            ESP_LOGW(TAG, "Lattice identity TX failed: %s", esp_err_to_name(identity_result));
+        }
+    }
+
     return ESP_OK;
 }
 
@@ -398,13 +679,15 @@ static esp_err_t handle_lora_rx_window(bool *telemetry_paused, bool *telemetry_n
         return ESP_ERR_INVALID_RESPONSE;
     }
 
+    if (packet.type == HOPE_PACKET_TYPE_HANDSHAKE) {
+        return handle_handshake_packet(&packet);
+    }
+
     return handle_command_packet(&packet, telemetry_paused, telemetry_now);
 }
 
 static void lora_task(void *arg) {
     (void)arg;
-
-    session_init(CUBESAT_DEMO_SESSION_ID);
 
     gnss_config_t gnss_config = {
         .uart_port = UART_NUM_1,
@@ -442,6 +725,7 @@ static void lora_task(void *arg) {
     }
 
     replay_init();
+    lattice_reassembly_reset(&s_lattice_rx);
     counter_store_record_t rx_counter;
     if (counter_store_load_rx(&rx_counter) == ESP_OK && rx_counter.session_id == session_get_id()) {
         if (replay_restore_session_counter(rx_counter.session_id, rx_counter.counter)) {

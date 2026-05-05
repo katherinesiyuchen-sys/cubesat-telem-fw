@@ -1,9 +1,10 @@
 import binascii
 import re
 
-from groundstation.backend.packet_parser import HOPE_HEADER_LEN, HOPE_PACKET_TYPE_ACK, HOPE_PACKET_TYPE_COMMAND, HOPE_PACKET_TYPE_DIAGNOSTIC, HOPE_PACKET_TYPE_TELEMETRY
+from groundstation.backend.packet_parser import HOPE_HEADER_LEN, HOPE_PACKET_TYPE_ACK, HOPE_PACKET_TYPE_COMMAND, HOPE_PACKET_TYPE_DIAGNOSTIC, HOPE_PACKET_TYPE_HANDSHAKE, HOPE_PACKET_TYPE_TELEMETRY
 from groundstation.models.command import ack_status_name, command_name_from_opcode, parse_ack_payload, parse_command_payload
 from groundstation.models.diagnostic import diagnostic_mask_names, diagnostic_status_name, parse_diagnostic_payload
+from groundstation.models.lattice import message_name, parse_fragment_payload
 from groundstation.models.telemetry import parse_telemetry_payload
 
 
@@ -115,6 +116,20 @@ def format_packet_result(result: dict) -> str:
             f"ack_status={ack_status_name(ack.status)} "
             f"detail={ack.detail_code} "
             f"msg={ack.message}"
+        )
+
+    if packet.packet_type == HOPE_PACKET_TYPE_HANDSHAKE:
+        fragment = parse_fragment_payload(packet.payload)
+        return (
+            f"{status} "
+            f"src={packet.src_id} "
+            f"dst={packet.dst_id} "
+            f"session=0x{packet.session_id:08X} "
+            f"counter={packet.counter} "
+            f"lattice={message_name(fragment.message_type)} "
+            f"transfer={fragment.transfer_id} "
+            f"fragment={fragment.fragment_index + 1}/{fragment.fragment_count} "
+            f"bytes={fragment.total_len}"
         )
 
     return (
