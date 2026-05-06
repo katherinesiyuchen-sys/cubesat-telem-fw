@@ -107,4 +107,30 @@ config CUBESAT_GNSS_BAUDRATE
     range 1200 921600
     default 9600
 
+config CUBESAT_WIFI_SSID
+    string "Backup Wi-Fi SSID"
+    default ""
+    help
+        Lab backup transport SSID. Leave empty to disable Wi-Fi UDP backup.
+
+config CUBESAT_WIFI_PASSWORD
+    string "Backup Wi-Fi password"
+    default ""
+
+config CUBESAT_WIFI_GROUND_HOST
+    string "Groundstation UDP host IPv4"
+    default "192.168.1.100"
+    help
+        IPv4 address of the groundstation computer running Master Control.
+
+config CUBESAT_WIFI_LOCAL_UDP_PORT
+    int "ESP32 local UDP command port"
+    range 1 65535
+    default 5010
+
+config CUBESAT_WIFI_GROUND_UDP_PORT
+    int "Groundstation UDP telemetry port"
+    range 1 65535
+    default 5011
+
 endmenu

@@ -3,6 +3,7 @@ import math
 import os
 import queue
 import random
+import socket
 import sys
 import threading
 import time
@@ -130,6 +131,7 @@ class CommandRecord:
     detail: str
     packet_counter: int = 0
     attempts: int = 0
+    arg: bytes | str = b""
 
 
 @dataclass
@@ -279,7 +281,15 @@ class FirmwareApi:
 
 
 class MastercontrolApp(tk.Tk):
-    def __init__(self, rangepi_port: str | None = None, rangepi_baud: int = 115200, simulate: bool = True) -> None:
+    def __init__(
+        self,
+        rangepi_port: str | None = None,
+        rangepi_baud: int = 115200,
+        simulate: bool = True,
+        udp_listen_port: int | None = None,
+        udp_target_host: str | None = None,
+        udp_target_port: int | None = None,
+    ) -> None:
         super().__init__()
 
         self.title("CubeSat Master Control")
@@ -340,6 +350,13 @@ class MastercontrolApp(tk.Tk):
         self.rangepi_link: SerialLink | None = None
         self.rangepi_lock = threading.Lock()
         self.rangepi_nodes_by_src: dict[int, str] = {}
+        self.udp_listen_port = udp_listen_port
+        self.udp_target = (udp_target_host, udp_target_port) if udp_target_host and udp_target_port else None
+        self.udp_socket: socket.socket | None = None
+        self.udp_running = False
+        self.udp_thread: threading.Thread | None = None
+        self.udp_queue: queue.Queue[tuple[bytes, tuple[str, int]]] = queue.Queue()
+        self.ground_transport = "lora" if rangepi_port else "wifi" if self.udp_target else "sim"
         self.master_pulse_phase = 0
         self.fleet_history = {
             "link": deque(maxlen=144),
@@ -378,6 +395,8 @@ class MastercontrolApp(tk.Tk):
             self._start_rangepi_reader()
         else:
             self._write_terminal("RangePi serial bridge idle; launch with --rangepi-port COMx when the USB radio is attached", "warn")
+        if self.udp_listen_port is not None or self.udp_target is not None:
+            self._start_udp_bridge()
         self.after(100, self._loop)
         if self.simulate:
             self.after(900, self._generate_terminal_event)
@@ -1124,6 +1143,62 @@ class MastercontrolApp(tk.Tk):
                 self.link_label.config(text="RANGEPI OFFLINE", fg=AMBER)
                 self._write_terminal(str(payload), "warn")
 
+    def _start_udp_bridge(self) -> None:
+        if self.udp_running:
+            return
+        listen_port = self.udp_listen_port or 5011
+        try:
+            self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.udp_socket.settimeout(0.2)
+            self.udp_socket.bind(("0.0.0.0", listen_port))
+        except Exception as exc:
+            self.udp_socket = None
+            self._write_terminal(f"Wi-Fi UDP bridge failed to bind port {listen_port}: {exc}", "bad")
+            return
+
+        self.udp_running = True
+        self.udp_thread = threading.Thread(target=self._udp_reader_loop, name="udp-bridge-reader", daemon=True)
+        self.udp_thread.start()
+        target = f"{self.udp_target[0]}:{self.udp_target[1]}" if self.udp_target else "not configured"
+        self._write_terminal(f"Wi-Fi UDP bridge online listen=0.0.0.0:{listen_port} target={target}", "good")
+
+    def _udp_reader_loop(self) -> None:
+        while self.udp_running:
+            sock = self.udp_socket
+            if sock is None:
+                return
+            try:
+                data, addr = sock.recvfrom(512)
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            if data:
+                self.udp_queue.put((data, addr))
+
+    def _drain_udp_queue(self) -> None:
+        while True:
+            try:
+                data, addr = self.udp_queue.get_nowait()
+            except queue.Empty:
+                return
+            self._handle_udp_datagram(data, addr)
+
+    def _handle_udp_datagram(self, data: bytes, addr: tuple[str, int]) -> None:
+        try:
+            raw_packet = parse_rangepi_line(data)
+            result = self.api.engine.handle_raw_packet(raw_packet)
+            packet = result["packet"]
+        except Exception as exc:
+            self._write_terminal(f"WIFI UDP parse error from {addr[0]}:{addr[1]}: {exc}", "bad")
+            return
+
+        self._write_terminal(
+            f"WIFI UDP RX from {addr[0]}:{addr[1]} type={packet.packet_type} counter={packet.counter}",
+            "info" if result["accepted"] else "bad",
+        )
+        self._dispatch_packet(packet, result, "wifi-rx")
+
     def _handle_rangepi_line(self, line: bytes) -> None:
         try:
             raw_packet = parse_rangepi_line(line)
@@ -1133,12 +1208,17 @@ class MastercontrolApp(tk.Tk):
             self._write_terminal(f"RANGEPI PARSE_ERROR {exc} raw={line[:80]!r}", "bad")
             return
 
+        self._dispatch_packet(packet, result, "rangepi-rx")
+
+    def _dispatch_packet(self, packet, result: dict, source: str) -> None:
+        source_label = "RANGEPI" if source.startswith("rangepi") else "WIFI"
+
         if packet.packet_type == HOPE_PACKET_TYPE_ACK:
             self._handle_ack_packet(packet, result)
             return
 
         if packet.packet_type == HOPE_PACKET_TYPE_DIAGNOSTIC:
-            self._handle_diagnostic_packet(packet, result, "rangepi-rx")
+            self._handle_diagnostic_packet(packet, result, source)
             return
 
         if packet.packet_type == HOPE_PACKET_TYPE_HANDSHAKE:
@@ -1146,7 +1226,7 @@ class MastercontrolApp(tk.Tk):
                 fragment = parse_fragment_payload(packet.payload)
                 status = "accepted" if result["accepted"] else "rejected"
                 self._write_terminal(
-                    f"RANGEPI LATTICE {message_name(fragment.message_type)} {status} "
+                    f"{source_label} LATTICE {message_name(fragment.message_type)} {status} "
                     f"fragment={fragment.fragment_index + 1}/{fragment.fragment_count} "
                     f"transfer={fragment.transfer_id} session=0x{packet.session_id:08X}",
                     "info" if result["accepted"] else "bad",
@@ -1173,7 +1253,7 @@ class MastercontrolApp(tk.Tk):
         if packet.packet_type != HOPE_PACKET_TYPE_TELEMETRY:
             status = "accepted" if result["accepted"] else "rejected"
             self._write_terminal(
-                f"RANGEPI packet type={packet.packet_type} {status} "
+                f"{source_label} packet type={packet.packet_type} {status} "
                 f"src={packet.src_id} counter={packet.counter} session=0x{packet.session_id:08X}",
                 "info" if result["accepted"] else "bad",
             )
@@ -1182,7 +1262,7 @@ class MastercontrolApp(tk.Tk):
         try:
             telemetry = parse_telemetry_payload(packet.payload)
         except Exception as exc:
-            self._write_terminal(f"RANGEPI telemetry decode failed: {exc}", "bad")
+            self._write_terminal(f"{source_label} telemetry decode failed: {exc}", "bad")
             return
 
         sat = self._hardware_node_for_packet(packet, telemetry)
@@ -1200,16 +1280,16 @@ class MastercontrolApp(tk.Tk):
         status = "accepted" if result["accepted"] else "rejected"
         if result["accepted"]:
             self._write_terminal(
-                f"RANGEPI RX {sat.name} accepted counter={packet.counter} "
+                f"{source_label} RX {sat.name} accepted counter={packet.counter} "
                 f"lat={telemetry.latitude:.4f} lon={telemetry.longitude:.4f} "
                 f"session=0x{packet.session_id:08X}",
                 "info",
             )
         else:
             self.replay_rejects += 1
-            self._write_alert(f"{sat.name} RangePi replay rejected counter={packet.counter}", "bad")
+            self._write_alert(f"{sat.name} {source_label} replay rejected counter={packet.counter}", "bad")
 
-        self._record_packet(sat, "rangepi-rx", packet.counter, packet.session_id, status)
+        self._record_packet(sat, source, packet.counter, packet.session_id, status)
 
     def _handle_diagnostic_packet(self, packet, result: dict, source: str) -> None:
         try:
@@ -1362,6 +1442,9 @@ class MastercontrolApp(tk.Tk):
         self._record_audit("rangepi", "operator", "rangepi", command, "sent")
         self._write_command(f"rangepi> {command}", "info")
 
+    def _has_hardware_link(self) -> bool:
+        return self.rangepi_port is not None or self.udp_target is not None
+
     def _send_rangepi_packet(self, raw_packet: bytes, label: str) -> bool:
         if not self.rangepi_port:
             self._write_command("RangePi bridge is not configured; restart with --rangepi-port COMx", "bad")
@@ -1385,6 +1468,33 @@ class MastercontrolApp(tk.Tk):
         self._write_command(f"rangepi-tx> {label} bytes={len(raw_packet)}", "info")
         return True
 
+    def _send_udp_packet(self, raw_packet: bytes, label: str) -> bool:
+        if self.udp_target is None:
+            self._write_command("Wi-Fi UDP target is not configured; launch with --udp-target-host and --udp-target-port", "bad")
+            return False
+        if self.udp_socket is None:
+            self._start_udp_bridge()
+        if self.udp_socket is None:
+            return False
+        try:
+            self.udp_socket.sendto(raw_packet, self.udp_target)
+        except Exception as exc:
+            self._write_command(f"Wi-Fi UDP TX failed: {exc}", "bad")
+            return False
+
+        self._record_audit("wifi", "groundstation", "udp", label, "sent")
+        self._write_command(f"wifi-tx> {label} bytes={len(raw_packet)} target={self.udp_target[0]}:{self.udp_target[1]}", "info")
+        return True
+
+    def _send_link_packet(self, raw_packet: bytes, label: str) -> bool:
+        if self.ground_transport == "wifi":
+            return self._send_udp_packet(raw_packet, label)
+        if self.rangepi_port:
+            return self._send_rangepi_packet(raw_packet, label)
+        if self.udp_target is not None:
+            return self._send_udp_packet(raw_packet, label)
+        return self._send_rangepi_packet(raw_packet, label)
+
     def _send_lattice_responses(self, sat: Satellite, dst_id: int, responses: list[LatticeResponse]) -> None:
         final_session_id = None
         for response in responses:
@@ -1404,7 +1514,7 @@ class MastercontrolApp(tk.Tk):
                     dst_id=dst_id,
                 )
                 label = f"pq:{message_name(response.message_type)}:{index + 1}/{chunks}"
-                if not self._send_rangepi_packet(raw_packet, label):
+                if not self._send_link_packet(raw_packet, label):
                     return
                 sat.counter = max(sat.counter, counter)
                 self._record_packet(sat, "pq-tx", counter, response.packet_session_id, "sent")
@@ -1432,6 +1542,7 @@ class MastercontrolApp(tk.Tk):
                 record.command_id,
                 record.command,
                 packet_counter=record.packet_counter,
+                arg=record.arg,
             )
         except Exception as exc:
             record.status = "failed"
@@ -1440,7 +1551,7 @@ class MastercontrolApp(tk.Tk):
             self._write_command(f"command packet build failed: {exc}", "bad")
             return False
 
-        if not self._send_rangepi_packet(raw_packet, f"cmd#{record.command_id}:{record.node_name}:{record.command}"):
+        if not self._send_link_packet(raw_packet, f"cmd#{record.command_id}:{record.node_name}:{record.command}"):
             record.status = "failed"
             record.detail = "radio bridge unavailable"
             record.updated_tick = self.tick
@@ -1457,6 +1568,7 @@ class MastercontrolApp(tk.Tk):
 
     def _on_close(self) -> None:
         self.rangepi_running = False
+        self.udp_running = False
         if getattr(self.api, "lattice", None) is not None:
             self.api.lattice.close()
         with self.rangepi_lock:
@@ -1466,6 +1578,12 @@ class MastercontrolApp(tk.Tk):
                 link.close()
             except Exception:
                 pass
+        if self.udp_socket is not None:
+            try:
+                self.udp_socket.close()
+            except Exception:
+                pass
+            self.udp_socket = None
         self.destroy()
 
     def _scoped_log_text(self, text: str, label: str) -> str:
@@ -1665,7 +1783,7 @@ class MastercontrolApp(tk.Tk):
 
         parts = command.lower().split()
         if parts[0] == "help":
-            self._write_command("commands: use <all|selected|node|#> | target | nodes | status | pq | node | selftest | addnode <name> <role> | delnode <name> | pair pin|kem|manual | rangepi <raw-cmd> | arm | isolate | connect | downlink | rotate | ping | zoomin | zoomout | google | street | track <1-5> | replay | handoff | pause | schedule | sessions", "info")
+            self._write_command("commands: use <all|selected|node|#> | target | nodes | status | pq | transport <lora|wifi|auto|ble> | node | selftest | addnode <name> <role> | delnode <name> | pair pin|kem|manual | rangepi <raw-cmd> | arm | isolate | connect | downlink | rotate | ping | zoomin | zoomout | google | street | track <1-5> | replay | handoff | pause | schedule | sessions", "info")
         elif parts[0] in ("use", "target", "select"):
             self._set_command_target(parts[1:] if len(parts) > 1 else [])
         elif parts[0] in ("nodes", "fleet"):
@@ -1687,6 +1805,8 @@ class MastercontrolApp(tk.Tk):
                 self._write_command(line, "good")
             for sat in self._command_target_nodes():
                 self._write_command(f"{sat.name}: {self.api.pq_session_state(sat.name, sat.session_id)}", tag)
+        elif parts[0] in ("transport", "link"):
+            self._run_transport_command(parts)
         elif parts[0] in ("node", "arm", "isolate", "connect", "downlink", "rotate", "ping"):
             self._run_node_command(parts[0])
         elif parts[0] in ("selftest", "diag", "diagnostic"):
@@ -1779,16 +1899,56 @@ class MastercontrolApp(tk.Tk):
     def _run_selftest_command(self) -> None:
         targets = self._command_target_nodes()
         for sat in targets:
-            if self.rangepi_port:
+            if self._has_hardware_link():
                 record = self._enqueue_command(sat, "selftest", "operator requested hardware self-test")
                 if self._send_hardware_command_packet(sat, record):
-                    self._write_command(f"requested {sat.name} hardware self-test over framed LoRa command", "info")
+                    self._write_command(f"requested {sat.name} hardware self-test over {self.ground_transport} command link", "info")
                 continue
 
             result = self.api.submit_diagnostic(sat)
             sat.counter += 1
             self._handle_diagnostic_packet(result["packet"], result, "selftest-sim")
         self._write_command(f"self-test dispatched to {len(targets)} target(s)", "info")
+
+    def _run_transport_command(self, parts: list[str]) -> None:
+        if len(parts) < 2:
+            self._write_command(
+                f"ground transport={self.ground_transport}; firmware command: transport lora | wifi | auto | ble",
+                "info",
+            )
+            return
+
+        mode = parts[1].lower()
+        if mode not in {"lora", "wifi", "auto", "ble", "bluetooth"}:
+            self._write_command("transport modes: lora | wifi | auto | ble", "bad")
+            return
+        if mode == "bluetooth":
+            mode = "ble"
+
+        targets = self._command_target_nodes()
+        previous_route = self.ground_transport
+        route_for_command = "wifi" if previous_route == "wifi" else "lora"
+        self.ground_transport = route_for_command
+
+        for sat in targets:
+            record = self._enqueue_command(sat, "transport", f"operator requested transport {mode}", arg=mode)
+            if self._has_hardware_link():
+                if self._send_hardware_command_packet(sat, record):
+                    self._write_command(f"transport {mode} sent to {sat.name} over {route_for_command}", "info")
+            else:
+                self._write_command(f"transport {mode} queued for {sat.name}", "info")
+
+        if mode == "wifi":
+            self.ground_transport = "wifi"
+        elif mode == "lora":
+            self.ground_transport = "lora"
+        elif mode == "auto":
+            self.ground_transport = "lora" if self.rangepi_port else "wifi" if self.udp_target else previous_route
+        else:
+            self.ground_transport = previous_route
+            self._write_command("BLE is reserved in firmware; no local BLE ground link is active yet", "warn")
+
+        self._write_terminal(f"GROUND TRANSPORT route={self.ground_transport} firmware_mode={mode}", "warn")
 
     def _apply_env_command(self, mode: str) -> None:
         if mode == "storm":
@@ -1822,9 +1982,9 @@ class MastercontrolApp(tk.Tk):
 
         for sat in targets:
             record = self._enqueue_command(sat, command, f"operator issued {command}")
-            if self.rangepi_port:
+            if self._has_hardware_link():
                 if self._send_hardware_command_packet(sat, record):
-                    self._write_command(f"{command} sent to {sat.name} over framed LoRa command", "info")
+                    self._write_command(f"{command} sent to {sat.name} over {self.ground_transport} command link", "info")
                 continue
 
             self._write_command(f"{command} queued for {sat.name}", "info")
@@ -1837,6 +1997,10 @@ class MastercontrolApp(tk.Tk):
             sat.command_state = "ARMED"
             sat.state = "READY"
             self._write_terminal(f"SECURE COMMAND arm issued to {sat.name}; ML-DSA authorization accepted", "info")
+        elif command == "transport":
+            sat.command_state = f"LINK-{self.ground_transport.upper()}"
+            sat.state = "LINK SWITCH"
+            self._write_terminal(f"{sat.name} transport route set to {self.ground_transport.upper()}", "warn")
         elif command == "isolate":
             sat.command_state = "ISOLATED"
             sat.online = False
@@ -1992,7 +2156,7 @@ class MastercontrolApp(tk.Tk):
         tk.Button(buttons, text="CREATE NODE", command=create, bg=PANEL, fg=TEXT, bd=0, highlightbackground="#1c2428", highlightthickness=1, padx=12, pady=8).pack(side="left")
         tk.Button(buttons, text="CANCEL", command=dialog.destroy, bg=PANEL, fg=TEXT, bd=0, highlightbackground="#1c2428", highlightthickness=1, padx=12, pady=8).pack(side="right")
 
-    def _enqueue_command(self, sat: Satellite, command: str, detail: str) -> CommandRecord:
+    def _enqueue_command(self, sat: Satellite, command: str, detail: str, arg: bytes | str = b"") -> CommandRecord:
         command_id = max(self.command_sequence, sat.counter + 1)
         record = CommandRecord(
             command_id=command_id,
@@ -2002,6 +2166,7 @@ class MastercontrolApp(tk.Tk):
             created_tick=self.tick,
             updated_tick=self.tick,
             detail=detail,
+            arg=arg,
         )
         self.command_sequence = command_id + 1
         self.command_queue.append(record)
@@ -2018,7 +2183,7 @@ class MastercontrolApp(tk.Tk):
                 self._record_audit("command", "groundstation", record.node_name, record.command, "sent")
                 self._write_terminal(f"CMD#{record.command_id} sent {record.node_name}:{record.command}", "info")
             elif record.status == "sent" and self.tick - record.updated_tick >= 10:
-                if self.rangepi_port and record.detail.startswith("waiting for radio ACK"):
+                if self._has_hardware_link() and record.detail.startswith("waiting for radio ACK"):
                     node = self._find_node(record.node_name)
                     if node is not None and record.attempts < RANGEPI_COMMAND_MAX_ATTEMPTS:
                         self._write_alert(
@@ -3365,6 +3530,7 @@ class MastercontrolApp(tk.Tk):
 
     def _loop(self) -> None:
         self._drain_rangepi_queue()
+        self._drain_udp_queue()
         self._drain_tile_downloads()
         if self.running:
             self.tick += 1
@@ -3422,15 +3588,28 @@ class MastercontrolApp(tk.Tk):
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="CubeSat Control dashboard")
+    parser.add_argument("--list-ports", action="store_true", help="List serial ports and exit")
     parser.add_argument("--rangepi-port", help="RangePi serial port, e.g. COM5 or /dev/ttyUSB0")
     parser.add_argument("--baud", type=int, default=115200, help="RangePi serial baud rate")
+    parser.add_argument("--udp-listen", type=int, help="Wi-Fi backup UDP listen port, default 5011 when UDP target is set")
+    parser.add_argument("--udp-target-host", help="ESP32 Wi-Fi backup target IPv4 address")
+    parser.add_argument("--udp-target-port", type=int, default=5010, help="ESP32 Wi-Fi backup command UDP port")
     parser.add_argument("--no-sim", action="store_true", help="Disable fake telemetry and wait for RangePi packets")
     args = parser.parse_args()
+
+    if args.list_ports:
+        from groundstation.tools.list_serial_ports import print_serial_ports
+
+        print_serial_ports()
+        return
 
     app = MastercontrolApp(
         rangepi_port=args.rangepi_port,
         rangepi_baud=args.baud,
         simulate=not args.no_sim,
+        udp_listen_port=args.udp_listen if args.udp_listen is not None else (5011 if args.udp_target_host else None),
+        udp_target_host=args.udp_target_host,
+        udp_target_port=args.udp_target_port,
     )
     app.mainloop()
 

@@ -17,6 +17,7 @@ COMMAND_OPCODE_OPEN_DOWNLINK = 7
 COMMAND_OPCODE_ISOLATE = 8
 COMMAND_OPCODE_CONNECT = 9
 COMMAND_OPCODE_ARM = 10
+COMMAND_OPCODE_SET_TRANSPORT = 11
 
 COMMAND_ACK_STATUS_OK = 0
 COMMAND_ACK_STATUS_REJECTED = 1
@@ -63,12 +64,16 @@ COMMAND_NAME_TO_OPCODE = {
     "isolate": COMMAND_OPCODE_ISOLATE,
     "connect": COMMAND_OPCODE_CONNECT,
     "arm": COMMAND_OPCODE_ARM,
+    "transport": COMMAND_OPCODE_SET_TRANSPORT,
+    "set-transport": COMMAND_OPCODE_SET_TRANSPORT,
+    "link": COMMAND_OPCODE_SET_TRANSPORT,
 }
 
 OPCODE_TO_COMMAND_NAME = {
     value: key
     for key, value in COMMAND_NAME_TO_OPCODE.items()
     if key not in {"diag", "diagnostic", "telemetry", "status", "rotate-session"}
+    and key not in {"set-transport", "link"}
 }
 
 ACK_STATUS_NAME = {

@@ -23,4 +23,34 @@ config CUBESAT_BRINGUP_ONLY
         starting the normal telemetry tasks. Enable this while wiring a new
         ESP32 board.
 
+choice CUBESAT_TRANSPORT_MODE
+    prompt "Primary packet transport"
+    default CUBESAT_TRANSPORT_MODE_LORA
+    help
+        Selects the packet carrier used by the telemetry task. The HOPE packet
+        bytes stay identical; only the carrier changes.
+
+config CUBESAT_TRANSPORT_MODE_LORA
+    bool "LoRa SX1262 only"
+
+config CUBESAT_TRANSPORT_MODE_WIFI_UDP
+    bool "Wi-Fi UDP only"
+
+config CUBESAT_TRANSPORT_MODE_AUTO
+    bool "Auto fallback: LoRa primary, Wi-Fi UDP backup"
+
+config CUBESAT_TRANSPORT_MODE_BLE_RESERVED
+    bool "Bluetooth LE reserved"
+    help
+        Reserved for a future BLE GATT packet service. The current firmware logs
+        the selection and falls back to LoRa/Wi-Fi behavior.
+
+endchoice
+
+config CUBESAT_TRANSPORT_AUTO_FAILS
+    int "LoRa failures before Wi-Fi fallback"
+    range 1 20
+    default 3
+    depends on CUBESAT_TRANSPORT_MODE_AUTO
+
 endmenu

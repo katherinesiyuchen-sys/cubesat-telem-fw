@@ -14,7 +14,9 @@
 #include "self_test.h"
 #include "telemetry_protocol.h"
 #include "session.h"
+#include "wifi_udp_transport.h"
 
+#include <ctype.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -39,6 +41,7 @@
 #define LORA_RX_POLL_MS 250
 #define GNSS_FIX_TIMEOUT_MS 1000
 #define COMMAND_HISTORY_SLOTS 12
+#define WIFI_CONNECT_TIMEOUT_MS 10000
 
 #ifndef CUBESAT_NODE_ID
 #define CUBESAT_NODE_ID 1
@@ -60,6 +63,30 @@
 #define CUBESAT_GNSS_BAUDRATE 9600
 #endif
 
+#ifndef CUBESAT_WIFI_SSID
+#define CUBESAT_WIFI_SSID ""
+#endif
+
+#ifndef CUBESAT_WIFI_PASSWORD
+#define CUBESAT_WIFI_PASSWORD ""
+#endif
+
+#ifndef CUBESAT_WIFI_GROUND_HOST
+#define CUBESAT_WIFI_GROUND_HOST "192.168.1.100"
+#endif
+
+#ifndef CUBESAT_WIFI_LOCAL_UDP_PORT
+#define CUBESAT_WIFI_LOCAL_UDP_PORT 5010
+#endif
+
+#ifndef CUBESAT_WIFI_GROUND_UDP_PORT
+#define CUBESAT_WIFI_GROUND_UDP_PORT 5011
+#endif
+
+#ifndef CONFIG_CUBESAT_TRANSPORT_AUTO_FAILS
+#define CONFIG_CUBESAT_TRANSPORT_AUTO_FAILS 3
+#endif
+
 #ifndef LORA_TASK_LOG_PACKET_HEX
 #if defined(CONFIG_CUBESAT_LOG_PACKET_HEX)
 #define LORA_TASK_LOG_PACKET_HEX 1
@@ -67,6 +94,13 @@
 #define LORA_TASK_LOG_PACKET_HEX 0
 #endif
 #endif
+
+typedef enum {
+    PACKET_TRANSPORT_LORA = 0,
+    PACKET_TRANSPORT_WIFI_UDP,
+    PACKET_TRANSPORT_AUTO,
+    PACKET_TRANSPORT_BLE_RESERVED,
+} packet_transport_mode_t;
 
 static const char *TAG = "lora_task";
 static uint32_t s_command_history[COMMAND_HISTORY_SLOTS];
@@ -79,6 +113,165 @@ static uint8_t s_ground_mlkem_ciphertext[MLKEM512_CIPHERTEXT_LEN];
 static uint16_t s_ground_mlkem_transfer_id;
 static bool s_ground_mldsa_public_key_valid;
 static bool s_ground_mlkem_ciphertext_valid;
+static bool s_lora_ready;
+static bool s_wifi_ready;
+static uint8_t s_lora_failures;
+static packet_transport_mode_t s_configured_transport;
+static packet_transport_mode_t s_active_transport;
+
+static const char *packet_transport_name(packet_transport_mode_t mode) {
+    switch (mode) {
+        case PACKET_TRANSPORT_LORA:
+            return "lora";
+        case PACKET_TRANSPORT_WIFI_UDP:
+            return "wifi";
+        case PACKET_TRANSPORT_AUTO:
+            return "auto";
+        case PACKET_TRANSPORT_BLE_RESERVED:
+            return "ble";
+        default:
+            return "unknown";
+    }
+}
+
+static packet_transport_mode_t packet_transport_default_mode(void) {
+#if defined(CONFIG_CUBESAT_TRANSPORT_MODE_WIFI_UDP)
+    return PACKET_TRANSPORT_WIFI_UDP;
+#elif defined(CONFIG_CUBESAT_TRANSPORT_MODE_AUTO)
+    return PACKET_TRANSPORT_AUTO;
+#elif defined(CONFIG_CUBESAT_TRANSPORT_MODE_BLE_RESERVED)
+    return PACKET_TRANSPORT_BLE_RESERVED;
+#else
+    return PACKET_TRANSPORT_LORA;
+#endif
+}
+
+static bool command_arg_equals(const command_request_t *request, const char *expected) {
+    if (request == NULL || expected == NULL) {
+        return false;
+    }
+
+    size_t expected_len = strlen(expected);
+    if (request->arg_len != expected_len) {
+        return false;
+    }
+
+    for (size_t i = 0; i < expected_len; ++i) {
+        char lhs = (char)tolower((unsigned char)request->arg[i]);
+        char rhs = (char)tolower((unsigned char)expected[i]);
+        if (lhs != rhs) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static esp_err_t command_arg_to_transport(const command_request_t *request, packet_transport_mode_t *out_mode) {
+    if (request == NULL || out_mode == NULL || request->arg_len == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (command_arg_equals(request, "lora")) {
+        *out_mode = PACKET_TRANSPORT_LORA;
+        return ESP_OK;
+    }
+    if (command_arg_equals(request, "wifi") || command_arg_equals(request, "wifi-udp")) {
+        *out_mode = PACKET_TRANSPORT_WIFI_UDP;
+        return ESP_OK;
+    }
+    if (command_arg_equals(request, "auto")) {
+        *out_mode = PACKET_TRANSPORT_AUTO;
+        return ESP_OK;
+    }
+    if (command_arg_equals(request, "ble") || command_arg_equals(request, "bluetooth")) {
+        *out_mode = PACKET_TRANSPORT_BLE_RESERVED;
+        return ESP_OK;
+    }
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+static esp_err_t packet_transport_can_use(packet_transport_mode_t mode) {
+    switch (mode) {
+        case PACKET_TRANSPORT_LORA:
+            return s_lora_ready ? ESP_OK : ESP_ERR_INVALID_STATE;
+        case PACKET_TRANSPORT_WIFI_UDP:
+            return s_wifi_ready ? ESP_OK : ESP_ERR_INVALID_STATE;
+        case PACKET_TRANSPORT_AUTO:
+            return (s_lora_ready || s_wifi_ready) ? ESP_OK : ESP_ERR_INVALID_STATE;
+        case PACKET_TRANSPORT_BLE_RESERVED:
+            return ESP_ERR_NOT_SUPPORTED;
+        default:
+            return ESP_ERR_INVALID_ARG;
+    }
+}
+
+static esp_err_t packet_transport_set_mode(packet_transport_mode_t mode) {
+    ESP_RETURN_ON_ERROR(packet_transport_can_use(mode), TAG, "transport unavailable");
+    s_configured_transport = mode;
+    if (mode == PACKET_TRANSPORT_AUTO) {
+        s_active_transport = s_lora_ready ? PACKET_TRANSPORT_LORA : PACKET_TRANSPORT_WIFI_UDP;
+    } else {
+        s_active_transport = mode;
+    }
+    ESP_LOGW(TAG, "Packet transport set configured=%s active=%s",
+        packet_transport_name(s_configured_transport),
+        packet_transport_name(s_active_transport)
+    );
+    return ESP_OK;
+}
+
+static esp_err_t packet_transport_send(const uint8_t *data, size_t len, uint32_t timeout_ms) {
+    if (s_active_transport == PACKET_TRANSPORT_WIFI_UDP) {
+        esp_err_t wifi_result = wifi_udp_transport_send(data, len, timeout_ms);
+        if (wifi_result == ESP_OK || s_configured_transport != PACKET_TRANSPORT_AUTO || !s_lora_ready) {
+            return wifi_result;
+        }
+        s_active_transport = PACKET_TRANSPORT_LORA;
+        return lora_send(data, len, timeout_ms);
+    }
+
+    esp_err_t lora_result = lora_send(data, len, timeout_ms);
+    if (lora_result == ESP_OK) {
+        s_lora_failures = 0;
+        return ESP_OK;
+    }
+
+    if (s_configured_transport == PACKET_TRANSPORT_AUTO && s_wifi_ready) {
+        s_lora_failures++;
+        if (s_lora_failures >= CONFIG_CUBESAT_TRANSPORT_AUTO_FAILS) {
+            ESP_LOGW(TAG, "LoRa TX failed %u times; falling back to Wi-Fi UDP", (unsigned)s_lora_failures);
+            s_active_transport = PACKET_TRANSPORT_WIFI_UDP;
+        }
+        return wifi_udp_transport_send(data, len, timeout_ms);
+    }
+
+    return lora_result;
+}
+
+static esp_err_t packet_transport_receive(uint8_t *data, size_t capacity, size_t *out_len, uint32_t timeout_ms) {
+    if (s_configured_transport == PACKET_TRANSPORT_WIFI_UDP) {
+        return wifi_udp_transport_receive(data, capacity, out_len, timeout_ms);
+    }
+
+    if (s_configured_transport == PACKET_TRANSPORT_AUTO) {
+        if (s_lora_ready) {
+            esp_err_t lora_result = lora_receive(data, capacity, out_len, timeout_ms / 2U);
+            if (lora_result != ESP_ERR_TIMEOUT) {
+                s_active_transport = PACKET_TRANSPORT_LORA;
+                return lora_result;
+            }
+        }
+        if (s_wifi_ready) {
+            esp_err_t wifi_result = wifi_udp_transport_receive(data, capacity, out_len, timeout_ms / 2U);
+            if (wifi_result != ESP_ERR_TIMEOUT) {
+                s_active_transport = PACKET_TRANSPORT_WIFI_UDP;
+                return wifi_result;
+            }
+        }
+        return ESP_ERR_TIMEOUT;
+    }
+
+    return lora_receive(data, capacity, out_len, timeout_ms);
+}
 
 static bool command_history_contains(uint32_t command_id) {
     for (size_t i = 0; i < COMMAND_HISTORY_SLOTS; ++i) {
@@ -197,7 +390,7 @@ static esp_err_t send_command_ack(
     }
 
     log_packet_hex(encoded, (size_t)encoded_len);
-    esp_err_t tx_result = lora_send(encoded, (size_t)encoded_len, LORA_TX_TIMEOUT_MS);
+    esp_err_t tx_result = packet_transport_send(encoded, (size_t)encoded_len, LORA_TX_TIMEOUT_MS);
     if (tx_result == ESP_OK) {
         (void)counter_store_save_tx(ack_packet.session_id, ack_packet.counter);
     }
@@ -246,7 +439,7 @@ static esp_err_t send_lattice_object(
         }
 
         log_packet_hex(encoded, (size_t)encoded_len);
-        esp_err_t tx_result = lora_send(encoded, (size_t)encoded_len, LORA_TX_TIMEOUT_MS);
+        esp_err_t tx_result = packet_transport_send(encoded, (size_t)encoded_len, LORA_TX_TIMEOUT_MS);
         if (tx_result != ESP_OK) {
             return tx_result;
         }
@@ -349,7 +542,7 @@ static esp_err_t transmit_telemetry_from_fix(const gnss_fix_t *fix, bool bench_f
 
     log_packet_hex(encoded, (size_t)encoded_len);
 
-    esp_err_t tx_result = lora_send(encoded, (size_t)encoded_len, LORA_TX_TIMEOUT_MS);
+    esp_err_t tx_result = packet_transport_send(encoded, (size_t)encoded_len, LORA_TX_TIMEOUT_MS);
     if (tx_result != ESP_OK) {
         return tx_result;
     }
@@ -571,6 +764,8 @@ static esp_err_t handle_command_packet(
     const char *message = "accepted";
     bool run_self_test = false;
     bool advertise_lattice_identity = false;
+    bool switch_transport_after_ack = false;
+    packet_transport_mode_t requested_transport = s_configured_transport;
 
     switch ((command_opcode_t)request.opcode) {
         case COMMAND_OPCODE_SELF_TEST:
@@ -608,6 +803,19 @@ static esp_err_t handle_command_packet(
         case COMMAND_OPCODE_ARM:
             message = "node armed";
             break;
+        case COMMAND_OPCODE_SET_TRANSPORT: {
+            esp_err_t arg_result = command_arg_to_transport(&request, &requested_transport);
+            if (arg_result != ESP_OK) {
+                return send_command_ack(packet, &request, COMMAND_ACK_STATUS_REJECTED, arg_result, "transport arg invalid");
+            }
+            esp_err_t transport_result = packet_transport_can_use(requested_transport);
+            if (transport_result != ESP_OK) {
+                return send_command_ack(packet, &request, COMMAND_ACK_STATUS_REJECTED, transport_result, "transport unavailable");
+            }
+            switch_transport_after_ack = true;
+            message = "transport switch queued";
+            break;
+        }
         default:
             return send_command_ack(packet, &request, COMMAND_ACK_STATUS_REJECTED, ESP_ERR_NOT_SUPPORTED, "opcode unsupported");
     }
@@ -635,14 +843,38 @@ static esp_err_t handle_command_packet(
         return ack_result;
     }
 
+    if (switch_transport_after_ack) {
+        esp_err_t switch_result = packet_transport_set_mode(requested_transport);
+        if (switch_result != ESP_OK) {
+            ESP_LOGW(TAG, "Transport switch failed after ACK: %s", esp_err_to_name(switch_result));
+        }
+    }
+
     if (run_self_test) {
         diagnostic_report_t report;
         esp_err_t self_test_result = self_test_run(&report, 0);
         if (self_test_result == ESP_OK) {
             self_test_log_report(&report);
-            esp_err_t emit_result = self_test_emit_report_packet(&report);
-            if (emit_result != ESP_OK) {
-                ESP_LOGW(TAG, "Self-test report TX failed: %s", esp_err_to_name(emit_result));
+            hope_packet_t diagnostic_packet;
+            uint8_t encoded[HOPE_MAX_PACKET_LEN];
+            size_t encoded_len = 0;
+            esp_err_t encode_result = self_test_encode_report_packet(
+                &report,
+                encoded,
+                sizeof(encoded),
+                &encoded_len,
+                &diagnostic_packet
+            );
+            if (encode_result == ESP_OK) {
+                log_packet_hex(encoded, encoded_len);
+                esp_err_t emit_result = packet_transport_send(encoded, encoded_len, LORA_TX_TIMEOUT_MS);
+                if (emit_result == ESP_OK) {
+                    (void)counter_store_save_tx(diagnostic_packet.session_id, diagnostic_packet.counter);
+                } else {
+                    ESP_LOGW(TAG, "Self-test report TX failed: %s", esp_err_to_name(emit_result));
+                }
+            } else {
+                ESP_LOGW(TAG, "Self-test report encode failed: %s", esp_err_to_name(encode_result));
             }
         } else {
             ESP_LOGW(TAG, "Self-test command failed: %s", esp_err_to_name(self_test_result));
@@ -662,12 +894,12 @@ static esp_err_t handle_command_packet(
 static esp_err_t handle_lora_rx_window(bool *telemetry_paused, bool *telemetry_now) {
     uint8_t rx[HOPE_MAX_PACKET_LEN];
     size_t rx_len = 0;
-    esp_err_t rx_result = lora_receive(rx, sizeof(rx), &rx_len, LORA_RX_POLL_MS);
+    esp_err_t rx_result = packet_transport_receive(rx, sizeof(rx), &rx_len, LORA_RX_POLL_MS);
     if (rx_result == ESP_ERR_TIMEOUT) {
         return ESP_OK;
     }
     if (rx_result != ESP_OK) {
-        ESP_LOGW(TAG, "LoRa RX failed: %s", esp_err_to_name(rx_result));
+        ESP_LOGW(TAG, "Packet transport RX failed: %s", esp_err_to_name(rx_result));
         return rx_result;
     }
 
@@ -675,7 +907,7 @@ static esp_err_t handle_lora_rx_window(bool *telemetry_paused, bool *telemetry_n
     int decode_result = packet_decode(rx, rx_len, &packet);
     if (decode_result != 0) {
         app_state_record_parse_error();
-        ESP_LOGW(TAG, "LoRa RX packet decode failed: %d", decode_result);
+        ESP_LOGW(TAG, "Packet transport RX packet decode failed: %d", decode_result);
         return ESP_ERR_INVALID_RESPONSE;
     }
 
@@ -684,6 +916,82 @@ static esp_err_t handle_lora_rx_window(bool *telemetry_paused, bool *telemetry_n
     }
 
     return handle_command_packet(&packet, telemetry_paused, telemetry_now);
+}
+
+static esp_err_t init_lora_transport(const lora_config_t *lora_config) {
+    if (lora_config == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    esp_err_t lora_init_result = lora_init(lora_config);
+    if (lora_init_result == ESP_OK) {
+        s_lora_ready = true;
+        ESP_LOGI(TAG, "LoRa transport online");
+    }
+    return lora_init_result;
+}
+
+static esp_err_t init_wifi_transport(void) {
+    wifi_udp_transport_config_t wifi_config = {
+        .ssid = CUBESAT_WIFI_SSID,
+        .password = CUBESAT_WIFI_PASSWORD,
+        .ground_host = CUBESAT_WIFI_GROUND_HOST,
+        .local_port = CUBESAT_WIFI_LOCAL_UDP_PORT,
+        .ground_port = CUBESAT_WIFI_GROUND_UDP_PORT,
+        .connect_timeout_ms = WIFI_CONNECT_TIMEOUT_MS,
+    };
+    esp_err_t wifi_result = wifi_udp_transport_init(&wifi_config);
+    if (wifi_result == ESP_OK) {
+        s_wifi_ready = true;
+        ESP_LOGI(TAG, "Wi-Fi UDP transport online local=%u ground=%s:%u",
+            (unsigned)CUBESAT_WIFI_LOCAL_UDP_PORT,
+            CUBESAT_WIFI_GROUND_HOST,
+            (unsigned)CUBESAT_WIFI_GROUND_UDP_PORT
+        );
+    } else {
+        s_wifi_ready = false;
+    }
+    return wifi_result;
+}
+
+static void init_packet_transports(const lora_config_t *lora_config) {
+    s_configured_transport = packet_transport_default_mode();
+    s_active_transport = PACKET_TRANSPORT_LORA;
+
+    while (1) {
+        if (s_configured_transport == PACKET_TRANSPORT_LORA || s_configured_transport == PACKET_TRANSPORT_AUTO) {
+            esp_err_t lora_result = init_lora_transport(lora_config);
+            if (lora_result != ESP_OK) {
+                ESP_LOGW(TAG, "LoRa init failed: %s", esp_err_to_name(lora_result));
+            }
+        }
+
+        if (s_configured_transport == PACKET_TRANSPORT_WIFI_UDP || s_configured_transport == PACKET_TRANSPORT_AUTO) {
+            esp_err_t wifi_result = init_wifi_transport();
+            if (wifi_result != ESP_OK) {
+                ESP_LOGW(TAG, "Wi-Fi UDP init failed: %s", esp_err_to_name(wifi_result));
+            }
+        }
+
+        if (s_configured_transport == PACKET_TRANSPORT_BLE_RESERVED) {
+            ESP_LOGW(TAG, "BLE transport is reserved; trying LoRa, then Wi-Fi UDP");
+            (void)init_lora_transport(lora_config);
+            if (!s_lora_ready) {
+                (void)init_wifi_transport();
+            }
+            if (s_lora_ready) {
+                s_configured_transport = PACKET_TRANSPORT_LORA;
+            } else if (s_wifi_ready) {
+                s_configured_transport = PACKET_TRANSPORT_WIFI_UDP;
+            }
+        }
+
+        if (packet_transport_set_mode(s_configured_transport) == ESP_OK) {
+            return;
+        }
+
+        ESP_LOGW(TAG, "No packet transport available; retrying");
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
 }
 
 static void lora_task(void *arg) {
@@ -717,12 +1025,7 @@ static void lora_task(void *arg) {
         ESP_LOGW(TAG, "GNSS init failed; telemetry will wait for recovery: %s", esp_err_to_name(gnss_init_result));
     }
 
-    esp_err_t lora_init_result = lora_init(&lora_config);
-    while (lora_init_result != ESP_OK) {
-        ESP_LOGW(TAG, "LoRa init failed; retrying: %s", esp_err_to_name(lora_init_result));
-        vTaskDelay(pdMS_TO_TICKS(5000));
-        lora_init_result = lora_init(&lora_config);
-    }
+    init_packet_transports(&lora_config);
 
     replay_init();
     lattice_reassembly_reset(&s_lattice_rx);
@@ -768,7 +1071,7 @@ static void lora_task(void *arg) {
             continue;
         }
         if (tx_result != ESP_OK) {
-            ESP_LOGE(TAG, "LoRa TX failed: %s", esp_err_to_name(tx_result));
+            ESP_LOGE(TAG, "Packet transport TX failed: %s", esp_err_to_name(tx_result));
             continue;
         }
 

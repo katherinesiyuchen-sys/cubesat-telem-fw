@@ -323,13 +323,19 @@ void self_test_log_report(const diagnostic_report_t *report) {
     );
 }
 
-esp_err_t self_test_emit_report_packet(const diagnostic_report_t *report) {
-    if (report == NULL) {
+esp_err_t self_test_encode_report_packet(
+    const diagnostic_report_t *report,
+    uint8_t *encoded,
+    size_t encoded_capacity,
+    size_t *out_len,
+    hope_packet_t *out_packet
+) {
+    if (report == NULL || encoded == NULL || out_len == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
+    *out_len = 0;
 
     hope_packet_t pkt;
-    uint8_t encoded[HOPE_MAX_PACKET_LEN];
     esp_err_t err = diagnostic_protocol_build_packet(report, &pkt);
     if (err != ESP_OK) {
         return err;
@@ -341,9 +347,29 @@ esp_err_t self_test_emit_report_packet(const diagnostic_report_t *report) {
     pkt.counter = session_next_counter();
     pkt.timestamp = (uint32_t)(esp_timer_get_time() / 1000000ULL);
 
-    int encoded_len = packet_encode(&pkt, encoded, sizeof(encoded));
+    int encoded_len = packet_encode(&pkt, encoded, encoded_capacity);
     if (encoded_len <= 0) {
         return ESP_FAIL;
+    }
+
+    *out_len = (size_t)encoded_len;
+    if (out_packet != NULL) {
+        *out_packet = pkt;
+    }
+    return ESP_OK;
+}
+
+esp_err_t self_test_emit_report_packet(const diagnostic_report_t *report) {
+    if (report == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    hope_packet_t pkt;
+    uint8_t encoded[HOPE_MAX_PACKET_LEN];
+    size_t encoded_len = 0;
+    esp_err_t err = self_test_encode_report_packet(report, encoded, sizeof(encoded), &encoded_len, &pkt);
+    if (err != ESP_OK) {
+        return err;
     }
 
     log_packet_hex(encoded, (size_t)encoded_len);
@@ -352,7 +378,7 @@ esp_err_t self_test_emit_report_packet(const diagnostic_report_t *report) {
         return ESP_ERR_INVALID_STATE;
     }
 
-    esp_err_t tx_result = lora_send(encoded, (size_t)encoded_len, SELF_TEST_LORA_TX_TIMEOUT_MS);
+    esp_err_t tx_result = lora_send(encoded, encoded_len, SELF_TEST_LORA_TX_TIMEOUT_MS);
     if (tx_result == ESP_OK) {
         (void)counter_store_save_tx(pkt.session_id, pkt.counter);
     }
