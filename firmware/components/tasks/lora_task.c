@@ -1,8 +1,11 @@
 #include "lora_task.h"
 
+#include "adaptive_cadence.h"
+#include "alert_logic.h"
 #include "app_state.h"
 #include "board_config.h"
 #include "command_protocol.h"
+#include "config_store.h"
 #include "counter_store.h"
 #include "diagnostic_protocol.h"
 #include "gnss.h"
@@ -135,6 +138,10 @@ static const char *packet_transport_name(packet_transport_mode_t mode) {
 }
 
 static packet_transport_mode_t packet_transport_default_mode(void) {
+    cubesat_app_state_t state = app_state_snapshot();
+    if (state.config.transport_mode <= (uint8_t)PACKET_TRANSPORT_BLE_RESERVED) {
+        return (packet_transport_mode_t)state.config.transport_mode;
+    }
 #if defined(CONFIG_CUBESAT_TRANSPORT_MODE_WIFI_UDP)
     return PACKET_TRANSPORT_WIFI_UDP;
 #elif defined(CONFIG_CUBESAT_TRANSPORT_MODE_AUTO)
@@ -187,6 +194,42 @@ static esp_err_t command_arg_to_transport(const command_request_t *request, pack
         return ESP_OK;
     }
     return ESP_ERR_NOT_SUPPORTED;
+}
+
+static esp_err_t command_arg_to_cadence(const command_request_t *request, cubesat_cadence_mode_t *out_mode) {
+    if (request == NULL || out_mode == NULL || request->arg_len == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (command_arg_equals(request, "auto")) {
+        *out_mode = CUBESAT_CADENCE_MODE_AUTO;
+        return ESP_OK;
+    }
+    if (command_arg_equals(request, "fast")) {
+        *out_mode = CUBESAT_CADENCE_MODE_FAST;
+        return ESP_OK;
+    }
+    if (command_arg_equals(request, "normal")) {
+        *out_mode = CUBESAT_CADENCE_MODE_NORMAL;
+        return ESP_OK;
+    }
+    if (command_arg_equals(request, "slow")) {
+        *out_mode = CUBESAT_CADENCE_MODE_SLOW;
+        return ESP_OK;
+    }
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+static void persist_runtime_modes(packet_transport_mode_t transport_mode, cubesat_cadence_mode_t cadence_mode) {
+    cubesat_runtime_config_t config;
+    if (config_store_load(&config) != ESP_OK) {
+        config_store_defaults(&config);
+    }
+    config.transport_mode = (uint8_t)transport_mode;
+    config.cadence_mode = (uint8_t)cadence_mode;
+    esp_err_t save_result = config_store_save(&config);
+    if (save_result != ESP_OK) {
+        ESP_LOGW(TAG, "Runtime config save failed: %s", esp_err_to_name(save_result));
+    }
 }
 
 static esp_err_t packet_transport_can_use(packet_transport_mode_t mode) {
@@ -300,8 +343,78 @@ static void make_bench_fix(gnss_fix_t *fix) {
     fix->valid = true;
     fix->latitude_e7 = 378715000;
     fix->longitude_e7 = -1222730000;
+    fix->altitude_m_x10 = 110;
+    fix->hdop_x100 = 90;
+    fix->speed_mps_x100 = 0;
+    fix->course_deg_x100 = 0;
+    fix->fix_age_ms = 0;
+    fix->utc_time_ms = 45319000;
+    fix->utc_date_ddmmyy = 10626;
     fix->fix_type = 3;
     fix->satellites = 8;
+    fix->source_flags = GNSS_FIX_FLAG_GGA | GNSS_FIX_FLAG_RMC | GNSS_FIX_FLAG_CHECKSUM;
+}
+
+static uint8_t clamp_percent_i32(int32_t value) {
+    if (value < 0) {
+        return 0;
+    }
+    if (value > 100) {
+        return 100;
+    }
+    return (uint8_t)value;
+}
+
+static uint8_t estimate_link_margin_percent(const gnss_fix_t *fix, bool bench_fix) {
+    if (fix == NULL || !fix->valid) {
+        return 25;
+    }
+    int32_t margin = 62 + ((int32_t)fix->satellites * 3) - ((int32_t)fix->hdop_x100 / 12);
+    if (fix->fix_age_ms > 1500U) {
+        margin -= (int32_t)((fix->fix_age_ms - 1500U) / 160U);
+    }
+    if (bench_fix) {
+        margin -= 8;
+    }
+    return clamp_percent_i32(margin);
+}
+
+static cubesat_cadence_input_t cadence_input_from_fix(const gnss_fix_t *fix, bool bench_fix) {
+    uint8_t link_margin = estimate_link_margin_percent(fix, bench_fix);
+    uint8_t risk = 12;
+    if (fix == NULL || !fix->valid || fix->fix_type == 0) {
+        risk += 28;
+    }
+    if (fix != NULL && fix->fix_age_ms > 1500U) {
+        risk += 18;
+    }
+    if (bench_fix) {
+        risk += 14;
+    }
+    if (link_margin < 55U) {
+        risk += (uint8_t)((55U - link_margin) / 2U);
+    }
+
+    cubesat_alert_input_t alert_input = {
+        .temperature_c_x10 = 230,
+        .satellites = fix != NULL ? fix->satellites : 0,
+        .fix_type = fix != NULL ? fix->fix_type : 0,
+        .link_margin_db_x10 = (int16_t)(((int16_t)link_margin - 50) * 10),
+        .replay_rejected = false,
+    };
+    cubesat_alert_result_t alert = alert_logic_evaluate(&alert_input);
+
+    return (cubesat_cadence_input_t){
+        .link_margin_percent = link_margin,
+        .battery_percent = 92,
+        .risk_percent = clamp_percent_i32(risk),
+        .temperature_c_x10 = 230,
+        .satellites = fix != NULL ? fix->satellites : 0,
+        .hdop_x100 = fix != NULL ? fix->hdop_x100 : 999,
+        .fix_age_ms = fix != NULL ? fix->fix_age_ms : 0xFFFFFFFFUL,
+        .alert_active = alert.level >= CUBESAT_ALERT_WARN,
+        .bench_fix = bench_fix,
+    };
 }
 
 static void log_packet_hex(const uint8_t *data, size_t len) {
@@ -551,11 +664,13 @@ static esp_err_t transmit_telemetry_from_fix(const gnss_fix_t *fix, bool bench_f
     app_state_record_tx(pkt.counter);
     ESP_LOGI(
         TAG,
-        "TX telemetry: counter=%lu lat_e7=%ld lon_e7=%ld sats=%u bytes=%d source=%s",
+        "TX telemetry: counter=%lu lat_e7=%ld lon_e7=%ld sats=%u hdop=%.2f age_ms=%lu bytes=%d source=%s",
         (unsigned long)pkt.counter,
         (long)fix->latitude_e7,
         (long)fix->longitude_e7,
         (unsigned)fix->satellites,
+        (double)fix->hdop_x100 / 100.0,
+        (unsigned long)fix->fix_age_ms,
         encoded_len,
         bench_fix ? "bench" : "gnss"
     );
@@ -766,6 +881,8 @@ static esp_err_t handle_command_packet(
     bool advertise_lattice_identity = false;
     bool switch_transport_after_ack = false;
     packet_transport_mode_t requested_transport = s_configured_transport;
+    bool switch_cadence_after_ack = false;
+    cubesat_cadence_mode_t requested_cadence = adaptive_cadence_mode();
 
     switch ((command_opcode_t)request.opcode) {
         case COMMAND_OPCODE_SELF_TEST:
@@ -816,6 +933,15 @@ static esp_err_t handle_command_packet(
             message = "transport switch queued";
             break;
         }
+        case COMMAND_OPCODE_SET_CADENCE: {
+            esp_err_t arg_result = command_arg_to_cadence(&request, &requested_cadence);
+            if (arg_result != ESP_OK) {
+                return send_command_ack(packet, &request, COMMAND_ACK_STATUS_REJECTED, arg_result, "cadence arg invalid");
+            }
+            switch_cadence_after_ack = true;
+            message = "cadence switch queued";
+            break;
+        }
         default:
             return send_command_ack(packet, &request, COMMAND_ACK_STATUS_REJECTED, ESP_ERR_NOT_SUPPORTED, "opcode unsupported");
     }
@@ -847,7 +973,15 @@ static esp_err_t handle_command_packet(
         esp_err_t switch_result = packet_transport_set_mode(requested_transport);
         if (switch_result != ESP_OK) {
             ESP_LOGW(TAG, "Transport switch failed after ACK: %s", esp_err_to_name(switch_result));
+        } else {
+            persist_runtime_modes(s_configured_transport, adaptive_cadence_mode());
         }
+    }
+
+    if (switch_cadence_after_ack) {
+        adaptive_cadence_set_mode(requested_cadence);
+        persist_runtime_modes(s_configured_transport, requested_cadence);
+        ESP_LOGW(TAG, "Adaptive cadence mode set to %s", adaptive_cadence_mode_name(requested_cadence));
     }
 
     if (run_self_test) {
@@ -916,6 +1050,27 @@ static esp_err_t handle_lora_rx_window(bool *telemetry_paused, bool *telemetry_n
     }
 
     return handle_command_packet(&packet, telemetry_paused, telemetry_now);
+}
+
+static void wait_for_next_telemetry(uint32_t wait_ms, bool *telemetry_paused, bool *telemetry_now) {
+    if (telemetry_paused == NULL || telemetry_now == NULL) {
+        vTaskDelay(pdMS_TO_TICKS(wait_ms));
+        return;
+    }
+
+    uint32_t elapsed_ms = 0;
+    while (elapsed_ms < wait_ms && !*telemetry_now) {
+        (void)handle_lora_rx_window(telemetry_paused, telemetry_now);
+        if (*telemetry_now) {
+            break;
+        }
+        uint32_t slice_ms = wait_ms - elapsed_ms;
+        if (slice_ms > LORA_RX_POLL_MS) {
+            slice_ms = LORA_RX_POLL_MS;
+        }
+        vTaskDelay(pdMS_TO_TICKS(slice_ms));
+        elapsed_ms += slice_ms;
+    }
 }
 
 static esp_err_t init_lora_transport(const lora_config_t *lora_config) {
@@ -1040,6 +1195,13 @@ static void lora_task(void *arg) {
     }
     bool telemetry_paused = false;
     bool telemetry_now = false;
+    cubesat_app_state_t initial_state = app_state_snapshot();
+    cubesat_cadence_mode_t initial_cadence = CUBESAT_CADENCE_MODE_AUTO;
+    if (initial_state.config.cadence_mode <= (uint8_t)CUBESAT_CADENCE_MODE_SLOW) {
+        initial_cadence = (cubesat_cadence_mode_t)initial_state.config.cadence_mode;
+    }
+    adaptive_cadence_init(initial_cadence);
+    cubesat_cadence_class_t last_cadence_class = CUBESAT_CADENCE_CLASS_NOMINAL;
 
     while (1) {
         gnss_fix_t fix;
@@ -1064,6 +1226,22 @@ static void lora_task(void *arg) {
 #endif
         }
 
+        cubesat_cadence_input_t cadence_input = cadence_input_from_fix(&fix, bench_fix);
+        const cubesat_cadence_state_t *cadence = adaptive_cadence_update(&cadence_input);
+        if (cadence != NULL && cadence->classifier != last_cadence_class) {
+            ESP_LOGW(
+                TAG,
+                "Adaptive cadence class=%s anomaly=%u interval=%lums target=%lums reason=%s mode=%s",
+                adaptive_cadence_class_name(cadence->classifier),
+                (unsigned)cadence->anomaly_score,
+                (unsigned long)cadence->interval_ms,
+                (unsigned long)cadence->target_interval_ms,
+                cadence->reason,
+                adaptive_cadence_mode_name(adaptive_cadence_mode())
+            );
+            last_cadence_class = cadence->classifier;
+        }
+
         esp_err_t tx_result = transmit_telemetry_from_fix(&fix, bench_fix);
         telemetry_now = false;
         if (tx_result == ESP_ERR_INVALID_ARG || tx_result == ESP_ERR_INVALID_STATE) {
@@ -1075,8 +1253,16 @@ static void lora_task(void *arg) {
             continue;
         }
 
-        (void)handle_lora_rx_window(&telemetry_paused, &telemetry_now);
-        vTaskDelay(pdMS_TO_TICKS(2000));
+        uint32_t wait_ms = cadence != NULL ? cadence->interval_ms : 2000U;
+        ESP_LOGI(
+            TAG,
+            "Next telemetry in %lums class=%s anomaly=%u reason=%s",
+            (unsigned long)wait_ms,
+            cadence != NULL ? adaptive_cadence_class_name(cadence->classifier) : "UNKNOWN",
+            cadence != NULL ? (unsigned)cadence->anomaly_score : 0U,
+            cadence != NULL ? cadence->reason : "fallback"
+        );
+        wait_for_next_telemetry(wait_ms, &telemetry_paused, &telemetry_now);
     }
 }
 

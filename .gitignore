@@ -15,4 +15,6 @@ Thumbs.db
 
 # Local deploy/cache output
 dist/
+groundstation/exports/
+groundstation/state/
 groundstation/ui/map_cache/

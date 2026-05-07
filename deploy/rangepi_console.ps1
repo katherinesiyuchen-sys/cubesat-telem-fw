@@ -1,6 +1,9 @@
 param(
     [string]$Port = $env:RANGEPI_PORT,
-    [int]$Baud = 115200
+    [int]$Baud = 115200,
+    [string]$SendHex,
+    [string]$SendCommand,
+    [switch]$ExitAfterSend
 )
 
 $ErrorActionPreference = "Stop"
@@ -19,4 +22,21 @@ if (-not $Port) {
 }
 
 $env:PYTHONPATH = [string]$RepoRoot
-& $Python -m groundstation.tools.rangepi_receiver --port $Port --baud $Baud --interactive
+$argsList = @(
+    "-m", "groundstation.tools.rangepi_receiver",
+    "--port", $Port,
+    "--baud", [string]$Baud,
+    "--interactive"
+)
+
+if ($SendHex) {
+    $argsList += @("--send-hex", $SendHex)
+}
+if ($SendCommand) {
+    $argsList += @("--send-command", $SendCommand)
+}
+if ($ExitAfterSend) {
+    $argsList += "--exit-after-send"
+}
+
+& $Python @argsList

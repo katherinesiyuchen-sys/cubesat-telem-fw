@@ -24,6 +24,16 @@ void config_store_defaults(cubesat_runtime_config_t *config) {
     config->lora_coding_rate = CUBESAT_LORA_CODING_RATE;
     config->lora_tx_power_dbm = CUBESAT_LORA_TX_POWER_DBM;
     config->gnss_baudrate = CUBESAT_GNSS_BAUDRATE;
+#if defined(CONFIG_CUBESAT_TRANSPORT_MODE_WIFI_UDP)
+    config->transport_mode = 1;
+#elif defined(CONFIG_CUBESAT_TRANSPORT_MODE_AUTO)
+    config->transport_mode = 2;
+#elif defined(CONFIG_CUBESAT_TRANSPORT_MODE_BLE_RESERVED)
+    config->transport_mode = 3;
+#else
+    config->transport_mode = 0;
+#endif
+    config->cadence_mode = 0;
 }
 
 esp_err_t config_store_load(cubesat_runtime_config_t *config) {

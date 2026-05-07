@@ -142,7 +142,7 @@ class RangePiSimulator:
             message = "duplicate command ack"
         else:
             self._handled_command_ids.add(command.command_id)
-            message = self._apply_command(command.opcode)
+            message = self._apply_command(command.opcode, command.arg)
 
         responses = [
             self._radio_line(
@@ -211,12 +211,20 @@ class RangePiSimulator:
         self._live_index += 1
         return self._radio_line(self._build_telemetry(node.session_id, node.src_id, node.dst_id, node))
 
-    def _apply_command(self, opcode: int) -> str:
+    def _apply_command(self, opcode: int, arg: bytes = b"") -> str:
         name = command_name_from_opcode(opcode)
         if name in {"pause", "isolate"}:
             self._paused = True
         elif name in {"resume", "connect", "downlink", "ping", "telemetry-now"}:
             self._paused = False
+        elif name == "cadence":
+            value = arg.decode("utf-8", errors="ignore").lower()
+            if value == "fast":
+                self._live_interval_s = 0.35
+            elif value == "slow":
+                self._live_interval_s = 1.8
+            elif value in {"normal", "auto"}:
+                self._live_interval_s = 0.75
         return f"sim {name} accepted"
 
     def _build_telemetry(self, session_id: int, src_id: int, dst_id: int, node: _VirtualNode | None = None) -> bytes:
@@ -226,6 +234,8 @@ class RangePiSimulator:
         longitude = (node.longitude if node is not None else -122.4194) + math.cos(phase * 0.8) * 0.00045
         temperature_c = (node.temperature_c if node is not None else 23.2) + math.sin(phase * 0.7) * 0.8
         satellites = node.satellites if node is not None else 9
+        speed_mps = abs(math.sin(phase * 0.4)) * 0.7
+        course_deg = (phase * 17.0) % 360.0
         return encode_telemetry_packet(
             counter=self._next_counter(),
             latitude=latitude,
@@ -233,6 +243,13 @@ class RangePiSimulator:
             temperature_c=temperature_c,
             fix_type=3,
             satellites=satellites,
+            altitude_m=11.0 + math.sin(phase * 0.5) * 2.0,
+            hdop=0.75 + abs(math.cos(phase)) * 0.35,
+            speed_mps=speed_mps,
+            course_deg=course_deg,
+            fix_age_ms=120 + int(abs(math.sin(phase)) * 260),
+            utc_time_ms=int((time.time() % 86400) * 1000),
+            utc_date_ddmmyy=60526,
             session_id=session_id,
             timestamp=int(time.time()),
             src_id=src_id,

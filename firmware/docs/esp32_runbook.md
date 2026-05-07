@@ -90,6 +90,15 @@ idf.py -p COM6 flash monitor
 
 Replace `COM6` with your ESP32 port.
 
+From a normal PowerShell, these wrappers activate ESP-IDF, build, flash, and
+open monitor from the repo root:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File deploy\esp_menuconfig.ps1 -Target esp32
+powershell -ExecutionPolicy Bypass -File deploy\esp_build.ps1 -Target esp32
+powershell -ExecutionPolicy Bypass -File deploy\esp_flash_monitor.ps1 -Port COM6 -Target esp32
+```
+
 ## 5. First expected output
 
 Before GNSS gets a fix, bench telemetry is enabled by default. You should see:
@@ -101,6 +110,16 @@ TX telemetry: counter=1 ... source=bench
 ```
 
 Once GNSS has a valid NMEA fix, the source changes to `gnss`.
+
+GNSS v2 telemetry includes the merged RMC/GGA state:
+
+```text
+TX telemetry: counter=1 lat_e7=... lon_e7=... sats=8 hdop=0.90 age_ms=120 bytes=56 source=gnss
+```
+
+The parser validates NMEA checksums, rejects no-fix sentences, and combines RMC
+speed/course/time/date with GGA satellites/HDOP/altitude. The dashboard raises
+GNSS alerts when fix age is stale, satellite count is low, or HDOP is high.
 
 ## 6. Connect RangePi groundstation
 

@@ -72,7 +72,10 @@ def format_packet_result(result: dict) -> str:
             f"lon={telemetry.longitude:.5f} "
             f"temp={telemetry.temperature_c:.1f}C "
             f"fix={telemetry.fix_type} "
-            f"sats={telemetry.satellites}"
+            f"sats={telemetry.satellites} "
+            f"hdop={telemetry.hdop:.2f} "
+            f"alt={telemetry.altitude_m:.1f}m "
+            f"age={telemetry.fix_age_ms}ms"
         )
 
     if packet.packet_type == HOPE_PACKET_TYPE_DIAGNOSTIC:

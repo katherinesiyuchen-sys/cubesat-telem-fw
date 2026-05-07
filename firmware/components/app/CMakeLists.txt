@@ -1,5 +1,6 @@
 idf_component_register(
     SRCS
+        "adaptive_cadence.c"
         "alert_logic.c"
         "app_state.c"
         "data_fusion.c"

@@ -38,12 +38,21 @@ if ($WithPQ) {
 }
 
 $env:PYTHONPATH = [string]$RepoRoot
-Invoke-RepoPython -ArgList @("-m", "py_compile", "groundstation\ui\mastercontrol_app.py", "groundstation\tools\rangepi_receiver.py", "groundstation\tools\rangepi_viewer.py")
+Invoke-RepoPython -ArgList @(
+    "-m",
+    "py_compile",
+    "groundstation\backend\node_registry.py",
+    "groundstation\ui\mastercontrol_app.py",
+    "groundstation\ui\mastercontrol_web.py",
+    "groundstation\tools\rangepi_receiver.py",
+    "groundstation\tools\rangepi_viewer.py"
+)
 
 Write-Host ""
 Write-Host "Groundstation deploy environment is ready."
 Write-Host "List ports:     deploy\list_serial_ports.ps1"
 Write-Host "RangePi viewer: deploy\run_rangepi_viewer.ps1 -Port COM5"
 Write-Host "Simulator:      deploy\run_mastercontrol_sim.ps1"
+Write-Host "Classic Tk sim: deploy\run_mastercontrol_sim.ps1 -Classic"
 Write-Host "Real RangePi:   deploy\run_mastercontrol_rangepi.ps1 -Port COM5"
 Write-Host "Wi-Fi backup:   deploy\run_mastercontrol_wifi.ps1 -Esp32Host 192.168.1.42"

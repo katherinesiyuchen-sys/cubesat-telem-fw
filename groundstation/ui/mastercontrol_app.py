@@ -1,11 +1,6 @@
-import argparse
 import math
 import os
-import queue
 import random
-import socket
-import sys
-import threading
 import time
 import tkinter as tk
 import webbrowser
@@ -16,59 +11,28 @@ from tkinter import ttk
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-if __package__ in {None, ""}:
-    repo_root = Path(__file__).resolve().parents[2]
-    if str(repo_root) not in sys.path:
-        sys.path.insert(0, str(repo_root))
-
 from groundstation.backend.event_engine import EventEngine
-from groundstation.backend.packet_parser import encode_command_packet, encode_diagnostic_packet, encode_handshake_packet, encode_telemetry_packet
-from groundstation.backend.pq_lattice import LatticeResponse, PQLatticeError, PQLatticeGround, PQLatticeUnavailable
-from groundstation.backend.rangepi import parse_rangepi_line
-from groundstation.backend.serial_link import SerialLink
-from groundstation.models.command import ack_status_name, command_opcode_from_name, parse_ack_payload
-from groundstation.models.diagnostic import diagnostic_mask_names, diagnostic_status_name, parse_diagnostic_payload
-from groundstation.models.lattice import LatticeReassembler, fragment_count, message_name, parse_fragment_payload
+from groundstation.backend.packet_parser import encode_telemetry_packet
 from groundstation.models.telemetry import parse_telemetry_payload
 
 
 BG = "#020203"
-PANEL = "#050607"
+PANEL = "#050505"
 PANEL_DARK = "#000000"
 CYAN = "#8bdde8"
 GREEN = "#9effb1"
 AMBER = "#e6c36a"
 MAGENTA = "#c59cff"
 RED = "#ff6678"
-DEEP_RED = "#8f1f2f"
 TEXT = "#eef7f8"
 MUTED = "#9aa3a6"
 WHITE_MAP = "#d6dddf"
 MAP_DARK = "#010101"
 LINE = "#20262a"
-GRID = "#151b1f"
-GHOST = "#0a1013"
 OSM_TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
 TILE_SIZE = 256
-HOPE_PACKET_TYPE_TELEMETRY = 1
-HOPE_PACKET_TYPE_HANDSHAKE = 3
-HOPE_PACKET_TYPE_ACK = 4
-HOPE_PACKET_TYPE_DIAGNOSTIC = 5
-HOPE_PACKET_TYPE_COMMAND = 6
-RANGEPI_COMMAND_MAX_ATTEMPTS = 3
 
 
-WORLD_POLYGONS = [
-    [(-168, 72), (-140, 70), (-124, 58), (-122, 49), (-102, 50), (-82, 45), (-67, 48), (-52, 58), (-66, 66), (-96, 73), (-132, 74)],
-    [(-126, 49), (-112, 34), (-105, 25), (-96, 18), (-87, 15), (-81, 25), (-76, 36), (-84, 45), (-102, 50)],
-    [(-82, 12), (-74, 8), (-70, -6), (-78, -18), (-74, -34), (-66, -48), (-58, -54), (-48, -38), (-40, -18), (-50, -4), (-62, 6)],
-    [(-18, 35), (4, 37), (24, 32), (34, 16), (32, -2), (24, -18), (18, -34), (10, -35), (0, -22), (-8, -4), (-16, 12)],
-    [(-10, 72), (18, 70), (40, 60), (42, 48), (28, 40), (8, 42), (-8, 52)],
-    [(34, 32), (52, 28), (76, 22), (92, 8), (104, -2), (116, 8), (122, 24), (108, 40), (82, 50), (58, 54), (40, 46)],
-    [(70, 58), (104, 62), (138, 55), (156, 48), (146, 34), (116, 30), (88, 38), (62, 48)],
-    [(112, -10), (138, -12), (154, -26), (146, -40), (126, -42), (112, -30)],
-    [(-52, 62), (-36, 74), (-18, 70), (-22, 58), (-42, 55)],
-]
 
 
 @dataclass
@@ -129,9 +93,6 @@ class CommandRecord:
     created_tick: int
     updated_tick: int
     detail: str
-    packet_counter: int = 0
-    attempts: int = 0
-    arg: bytes | str = b""
 
 
 @dataclass
@@ -165,13 +126,6 @@ class FirmwareApi:
 
     def __init__(self) -> None:
         self.engine = EventEngine()
-        self.lattice_reassemblers: dict[tuple[str, int, int], LatticeReassembler] = {}
-        try:
-            self.lattice = PQLatticeGround()
-            self.lattice_status = "PC liboqs ready"
-        except PQLatticeUnavailable as exc:
-            self.lattice = None
-            self.lattice_status = str(exc)
 
     def submit_telemetry(
         self,
@@ -198,109 +152,18 @@ class FirmwareApi:
         result["satellite"] = sat
         return result
 
-    def submit_diagnostic(self, sat: Satellite) -> dict:
-        raw = encode_diagnostic_packet(
-            counter=sat.counter,
-            session_id=sat.session_id,
-            timestamp=int(time.time()),
-            boot_count=sat.boot_count,
-            warning_mask=0x0006,
-            i2c_devices_seen=1 if sat.node_role != "field-sensor" else 0,
-        )
-        result = self.engine.handle_raw_packet(raw)
-        result["diagnostic"] = parse_diagnostic_payload(result["packet"].payload)
-        result["satellite"] = sat
-        return result
-
-    def build_command(
-        self,
-        sat: Satellite,
-        command_id: int,
-        command_name: str,
-        *,
-        packet_counter: int | None = None,
-        arg: bytes | str = b"",
-    ) -> bytes:
-        opcode = command_opcode_from_name(command_name)
-        auth_key = None
-        if self.lattice is not None:
-            auth_key = self.lattice.command_auth_key(sat.name, sat.session_id)
-        return encode_command_packet(
-            command_id=command_id,
-            opcode=opcode,
-            counter=packet_counter if packet_counter is not None else command_id,
-            session_id=sat.session_id,
-            timestamp=int(time.time()),
-            src_id=2,
-            dst_id=1,
-            auth_key=auth_key,
-            arg=arg,
-        )
-
-    def handle_lattice_fragment(self, node_name: str, packet, fragment) -> list[LatticeResponse]:
-        key = (node_name, fragment.message_type, fragment.transfer_id)
-        reassembler = self.lattice_reassemblers.setdefault(key, LatticeReassembler())
-        object_bytes = reassembler.add(fragment)
-        if object_bytes is None:
-            return []
-
-        self.lattice_reassemblers.pop(key, None)
-        if self.lattice is None:
-            raise PQLatticeUnavailable(self.lattice_status)
-
-        return self.lattice.process_node_object(
-            node_name,
-            fragment.message_type,
-            fragment.transfer_id,
-            packet.session_id,
-            object_bytes,
-        )
-
-    def pq_session_count(self) -> int:
-        if self.lattice is None:
-            return 0
-        return self.lattice.session_count()
-
-    def pq_session_state(self, node_name: str, session_id: int) -> str:
-        if self.lattice is None:
-            return "BACKEND OFFLINE"
-        session = self.lattice.session_for_node(node_name)
-        if session is None:
-            return "AWAITING ROTATE"
-        if session.session_id == session_id:
-            return "SESSION AUTH"
-        return f"SESSION 0x{session.session_id:08X}"
-
-    def pq_session_lines(self) -> list[str]:
-        if self.lattice is None:
-            return []
-        return [
-            f"{node:<15} session=0x{session_id:08X} transfer={transfer_id}"
-            for node, session_id, transfer_id in self.lattice.session_summaries()
-        ]
-
 
 class MastercontrolApp(tk.Tk):
-    def __init__(
-        self,
-        rangepi_port: str | None = None,
-        rangepi_baud: int = 115200,
-        simulate: bool = True,
-        udp_listen_port: int | None = None,
-        udp_target_host: str | None = None,
-        udp_target_port: int | None = None,
-    ) -> None:
+    def __init__(self) -> None:
         super().__init__()
 
-        self.title("CubeSat Master Control")
+        self.title("CUBESAT Mastercontrol")
         self.geometry("1380x840")
         self.minsize(980, 680)
         self.configure(bg=BG)
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.api = FirmwareApi()
         self.running = True
-        self.simulate = simulate
         self.tick = 0
         self.selected_index = 0
         self.log_lines = 0
@@ -316,18 +179,12 @@ class MastercontrolApp(tk.Tk):
         self.map_detail_zoom = 15
         self.map_focused_satellite: Satellite | None = None
         self.map_redraw_after_id: str | None = None
-        self.map_needs_redraw = True
-        self.last_map_draw_tick = -999
-        self.map_min_redraw_ticks = 3
         self.tile_cache_dir = Path(__file__).with_name("map_cache")
         self.tile_images: dict[tuple[int, int, int], tk.PhotoImage] = {}
         self.tile_failures: set[tuple[int, int, int]] = set()
-        self.tile_pending_downloads: set[tuple[int, int, int]] = set()
-        self.tile_result_queue: queue.Queue[tuple[tuple[int, int, int], bool]] = queue.Queue()
         self.node_detail_window: tk.Toplevel | None = None
         self.node_detail_widgets: dict[str, tk.Widget] = {}
         self.command_sequence = 1
-        self.command_target = "SELECTED"
         self.command_queue: list[CommandRecord] = []
         self.alert_sequence = 1
         self.alert_records: list[AlertRecord] = []
@@ -338,36 +195,7 @@ class MastercontrolApp(tk.Tk):
         self.alert_drawer_widgets: dict[str, tk.Widget] = {}
         self.operations_window: tk.Toplevel | None = None
         self.operations_widgets: dict[str, tk.Widget] = {}
-        self.operations_scope = "ALL"
-        self.rendering_sat_list = False
-        self.telemetry_cursor = 0
         self.pan_start: tuple[int, int, float, float] | None = None
-        self.rangepi_port = rangepi_port
-        self.rangepi_baud = rangepi_baud
-        self.rangepi_queue: queue.Queue[tuple[str, object]] = queue.Queue()
-        self.rangepi_running = False
-        self.rangepi_thread: threading.Thread | None = None
-        self.rangepi_link: SerialLink | None = None
-        self.rangepi_lock = threading.Lock()
-        self.rangepi_nodes_by_src: dict[int, str] = {}
-        self.udp_listen_port = udp_listen_port
-        self.udp_target = (udp_target_host, udp_target_port) if udp_target_host and udp_target_port else None
-        self.udp_socket: socket.socket | None = None
-        self.udp_running = False
-        self.udp_thread: threading.Thread | None = None
-        self.udp_queue: queue.Queue[tuple[bytes, tuple[str, int]]] = queue.Queue()
-        self.ground_transport = "lora" if rangepi_port else "wifi" if self.udp_target else "sim"
-        self.master_pulse_phase = 0
-        self.fleet_history = {
-            "link": deque(maxlen=144),
-            "risk": deque(maxlen=144),
-            "packets": deque(maxlen=144),
-            "open": deque(maxlen=144),
-            "alerts": deque(maxlen=144),
-            "health": deque(maxlen=144),
-            "radiation": deque(maxlen=144),
-            "loss": deque(maxlen=144),
-        }
 
         self.satellites = [
             Satellite("SF-MISSION", 0xA13C91E0, CYAN, 0.1, 0.0, "READY", "ML-KEM READY", 1240, 88, 9, 22.8, 360, 360, 37.7749, -122.4194, "mission-control"),
@@ -381,27 +209,12 @@ class MastercontrolApp(tk.Tk):
         self._build_styles()
         for sat in self.satellites:
             self._init_node_history(sat)
-        self._seed_fleet_history()
         self._build_layout()
-        self.bind_all("<Control-grave>", self._focus_command_terminal)
-        self.bind_all("<Control-l>", self._focus_command_terminal)
-        self._write_terminal("CUBESAT MASTER CONTROL boot sequence complete", "info")
+        self._write_terminal("MASTERCONTROL boot sequence complete", "info")
         self._write_terminal("Python dashboard online; firmware C API boundary attached", "info")
-        self._write_terminal(f"PQ lattice backend: {self.api.lattice_status}", "good" if self.api.lattice else "warn")
         self._write_alert("Simulated constellation pass queue initialized", "info")
-        self._update_command_prompts()
-        self._animate_master_control()
-        if self.rangepi_port:
-            self._start_rangepi_reader()
-        else:
-            self._write_terminal("RangePi serial bridge idle; launch with --rangepi-port COMx when the USB radio is attached", "warn")
-        if self.udp_listen_port is not None or self.udp_target is not None:
-            self._start_udp_bridge()
         self.after(100, self._loop)
-        if self.simulate:
-            self.after(900, self._generate_terminal_event)
-        else:
-            self._write_terminal("Simulation telemetry disabled; waiting for RangePi packets", "warn")
+        self.after(900, self._generate_terminal_event)
 
     def _build_styles(self) -> None:
         style = ttk.Style()
@@ -502,67 +315,27 @@ class MastercontrolApp(tk.Tk):
             sat.history["loss"].append(sat.packet_loss_percent + abs(math.sin(index * 0.21 + sat.phase)) * 1.4)
             sat.history["radiation"].append(sat.radiation_cpm + math.sin(index * 0.19 + sat.phase) * 3.0)
 
-    def _seed_fleet_history(self) -> None:
-        for index in range(48):
-            phase = index / 8.0
-            avg_link = sum(node.link_margin for node in self.satellites) / max(1, len(self.satellites))
-            avg_loss = sum(node.packet_loss_percent for node in self.satellites) / max(1, len(self.satellites))
-            avg_health = sum(self._node_health_score(node) for node in self.satellites) / max(1, len(self.satellites))
-            self.fleet_history["link"].append(avg_link + math.sin(phase) * 2.4)
-            self.fleet_history["risk"].append(self.env.risk + abs(math.sin(phase * 0.7)) * 4.0)
-            self.fleet_history["packets"].append(sum(node.counter for node in self.satellites) - (48 - index) * 4)
-            self.fleet_history["open"].append(1 + abs(math.sin(phase * 0.8)) * 2.0)
-            self.fleet_history["alerts"].append(max(0, self.alerts - (48 - index) // 12))
-            self.fleet_history["health"].append(avg_health + math.sin(phase * 0.6) * 1.6)
-            self.fleet_history["radiation"].append(self.env.radiation + math.sin(phase * 0.5) * 3.0)
-            self.fleet_history["loss"].append(avg_loss + abs(math.sin(phase * 0.9)) * 1.1)
-
-    def _append_fleet_history(self) -> None:
-        avg_link = sum(node.link_margin for node in self.satellites) / max(1, len(self.satellites))
-        avg_loss = sum(node.packet_loss_percent for node in self.satellites) / max(1, len(self.satellites))
-        avg_health = sum(self._node_health_score(node) for node in self.satellites) / max(1, len(self.satellites))
-        open_contacts = sum(1 for node in self.satellites if self._contact_state(node) == "OPEN")
-        self.fleet_history["link"].append(avg_link)
-        self.fleet_history["risk"].append(self.env.risk)
-        self.fleet_history["packets"].append(sum(node.counter for node in self.satellites))
-        self.fleet_history["open"].append(open_contacts)
-        self.fleet_history["alerts"].append(len([alert for alert in self.alert_records if alert.status == "open"]))
-        self.fleet_history["health"].append(avg_health)
-        self.fleet_history["radiation"].append(self.env.radiation)
-        self.fleet_history["loss"].append(avg_loss)
-
     def _build_layout(self) -> None:
         self.columnconfigure(0, weight=1)
         self.rowconfigure(1, weight=1)
 
-        self.top_frame = tk.Frame(self, bg=PANEL_DARK, highlightbackground=CYAN, highlightthickness=1)
-        self.top_frame.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 8))
-        self.top_frame.columnconfigure(0, weight=1)
-        self.top_frame.columnconfigure(1, weight=0)
+        top = tk.Frame(self, bg=PANEL_DARK, highlightbackground=CYAN, highlightthickness=1)
+        top.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 8))
+        top.columnconfigure(0, weight=1)
 
-        self.title_label = tk.Label(self.top_frame, text="CUBESAT MASTER CONTROL", bg=PANEL_DARK, fg=TEXT, font=("Segoe UI", 24, "bold"))
-        self.title_label.grid(row=0, column=0, sticky="w", padx=14, pady=(10, 0))
+        title = tk.Label(top, text="CubeSat CONTROL", bg=PANEL_DARK, fg=TEXT, font=("Segoe UI", 24))
+        title.grid(row=0, column=0, sticky="w", padx=14, pady=(10, 0))
 
         subtitle = tk.Label(
-            self.top_frame,
-            text="CubeSat node operations / firmware protocol API / Bay Area fixed-site map",
+            top,
+            text="secure node operations / firmware protocol API",
             bg=PANEL_DARK,
             fg=MUTED,
             font=("Consolas", 10),
         )
         subtitle.grid(row=1, column=0, sticky="w", padx=15, pady=(0, 12))
 
-        self.master_pulse_label = tk.Label(
-            self.top_frame,
-            text="MASTER CONTROL // COMMAND TARGET SELECTED",
-            bg=PANEL_DARK,
-            fg=RED,
-            font=("Consolas", 9, "bold"),
-            anchor="w",
-        )
-        self.master_pulse_label.grid(row=2, column=0, sticky="ew", padx=15, pady=(0, 10))
-
-        controls = tk.Frame(self.top_frame, bg=PANEL_DARK)
+        controls = tk.Frame(top, bg=PANEL_DARK)
         controls.grid(row=0, column=1, rowspan=2, sticky="e", padx=12)
 
         self.link_label = tk.Label(controls, text="SIM-LINK ONLINE", bg="#030806", fg=GREEN, font=("Consolas", 10), padx=12, pady=8)
@@ -574,9 +347,6 @@ class MastercontrolApp(tk.Tk):
         self.pause_button = self._button(controls, "PAUSE", self._toggle_pause)
         self.replay_button = self._button(controls, "INJECT REPLAY", self._inject_replay)
         self.handoff_button = self._button(controls, "FORCE HANDOFF", self._force_handoff)
-
-        self.header_hud = tk.Canvas(self.top_frame, width=430, height=34, bg=PANEL_DARK, highlightthickness=0)
-        self.header_hud.grid(row=2, column=1, sticky="e", padx=12, pady=(0, 8))
 
         main = tk.Frame(self, bg=BG)
         main.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
@@ -680,7 +450,7 @@ class MastercontrolApp(tk.Tk):
 
     def _build_state(self) -> None:
         self.state_labels: dict[str, tk.Label] = {}
-        labels = ["Accepted Frames", "Replay Rejects", "Average Link", "Ground Mode", "PQ Lattice", "LoRa Channel"]
+        labels = ["Accepted Frames", "Replay Rejects", "Average Link", "Ground Mode", "Lattice Layer", "LoRa Channel"]
         for index, label in enumerate(labels):
             tile = tk.Frame(self.state_frame.body, bg=PANEL_DARK, highlightbackground="#20282c", highlightthickness=1)
             tile.grid(row=index // 2, column=index % 2, sticky="nsew", padx=4, pady=4)
@@ -690,16 +460,6 @@ class MastercontrolApp(tk.Tk):
             value = tk.Label(tile, text="--", bg=PANEL_DARK, fg=TEXT, font=("Consolas", 18, "bold"), anchor="w")
             value.pack(fill="x", padx=8, pady=(4, 8))
             self.state_labels[label] = value
-
-        self.state_frame.body.rowconfigure(3, weight=2)
-        self.fleet_graph_canvas = tk.Canvas(
-            self.state_frame.body,
-            bg="#010507",
-            highlightthickness=1,
-            highlightbackground="#1c2428",
-            height=190,
-        )
-        self.fleet_graph_canvas.grid(row=3, column=0, columnspan=2, sticky="nsew", padx=4, pady=(8, 4))
 
     def _build_node_inspector(self) -> None:
         self.inspector = tk.Text(
@@ -819,8 +579,7 @@ class MastercontrolApp(tk.Tk):
         command_bar = tk.Frame(command_tab, bg=PANEL_DARK)
         command_bar.grid(row=1, column=0, sticky="ew", pady=(8, 0))
         command_bar.columnconfigure(1, weight=1)
-        self.command_prompt_label = tk.Label(command_bar, text="master[selected]>", bg=PANEL_DARK, fg=CYAN, font=("Consolas", 10))
-        self.command_prompt_label.grid(row=0, column=0, padx=(8, 6), pady=8)
+        tk.Label(command_bar, text="mastercontrol>", bg=PANEL_DARK, fg=CYAN, font=("Consolas", 10)).grid(row=0, column=0, padx=(8, 6), pady=8)
         self.command_entry = tk.Entry(
             command_bar,
             bg="#02080b",
@@ -925,12 +684,6 @@ class MastercontrolApp(tk.Tk):
     def _open_operations_window(self) -> None:
         if self.operations_window is not None and self.operations_window.winfo_exists():
             self.operations_window.lift()
-            mirror = self.operations_widgets.get("tabs")
-            if isinstance(mirror, ttk.Notebook):
-                mirror.select(1)
-            command_entry = self.operations_widgets.get("COMMAND_ENTRY")
-            if isinstance(command_entry, tk.Entry):
-                command_entry.focus_set()
             return
 
         window = tk.Toplevel(self)
@@ -943,11 +696,8 @@ class MastercontrolApp(tk.Tk):
         window.rowconfigure(0, weight=1)
         self.operations_window = window
 
-        top = tk.Frame(window, bg=PANEL_DARK)
-        top.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 0))
-        top.columnconfigure(0, weight=1)
         tk.Label(
-            top,
+            window,
             text="OPERATIONS WORKSPACE",
             bg=PANEL_DARK,
             fg=TEXT,
@@ -955,19 +705,12 @@ class MastercontrolApp(tk.Tk):
             anchor="w",
             padx=14,
             pady=10,
-        ).grid(row=0, column=0, sticky="ew")
-
-        self.operations_scope_var = tk.StringVar(value=self.operations_scope)
-        scope_values = ["ALL"] + [node.name for node in self.satellites]
-        scope = ttk.Combobox(top, textvariable=self.operations_scope_var, values=scope_values, state="readonly", width=22)
-        scope.grid(row=0, column=1, sticky="e", padx=12)
-        scope.bind("<<ComboboxSelected>>", self._on_operations_scope_changed)
-        self.operations_widgets["scope"] = scope
+        ).grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 0))
 
         mirror = ttk.Notebook(window)
         mirror.grid(row=1, column=0, sticky="nsew", padx=12, pady=12)
         window.rowconfigure(1, weight=1)
-        self.operations_widgets = {"scope": scope, "tabs": mirror}
+        self.operations_widgets = {}
 
         for name in ["FEED", "COMMAND", "CONTACTS", "CHARTS", "ALERTS", "NODES", "QUEUE", "PACKETS", "AUDIT", "POSTURE"]:
             tab = tk.Frame(mirror, bg=PANEL)
@@ -975,105 +718,7 @@ class MastercontrolApp(tk.Tk):
             tab.columnconfigure(0, weight=1)
             mirror.add(tab, text=name)
             self._build_operations_mirror_tab(name, tab)
-        mirror.select(1)
         self._refresh_operations_window()
-        command_entry = self.operations_widgets.get("COMMAND_ENTRY")
-        if isinstance(command_entry, tk.Entry):
-            command_entry.focus_set()
-
-    def _focus_command_terminal(self, _event=None) -> str:
-        self._open_operations_window()
-        command_entry = self.operations_widgets.get("COMMAND_ENTRY")
-        if isinstance(command_entry, tk.Entry):
-            command_entry.focus_set()
-        return "break"
-
-    def _command_target_label(self) -> str:
-        if self.command_target == "ALL":
-            return "ALL"
-        if self.command_target == "SELECTED":
-            return self.satellites[self.selected_index].name
-        return self.command_target
-
-    def _command_target_nodes(self) -> list[Satellite]:
-        if self.command_target == "ALL":
-            return list(self.satellites)
-        if self.command_target == "SELECTED":
-            return [self.satellites[self.selected_index]]
-        node = self._find_node(self.command_target)
-        return [node] if node is not None else [self.satellites[self.selected_index]]
-
-    def _resolve_node_token(self, token: str) -> Satellite | None:
-        clean = token.strip().upper()
-        if clean.isdigit():
-            index = int(clean) - 1
-            if 0 <= index < len(self.satellites):
-                return self.satellites[index]
-            return None
-        for node in self.satellites:
-            if node.name == clean or node.name.startswith(clean):
-                return node
-        return None
-
-    def _update_command_prompts(self) -> None:
-        label = self._command_target_label()
-        prompt = f"master[{label}]>"
-        color = RED if self.command_target == "ALL" else CYAN
-
-        if hasattr(self, "command_prompt_label"):
-            self.command_prompt_label.config(text=prompt, fg=color)
-
-        operations_prompt = self.operations_widgets.get("COMMAND_PROMPT")
-        if isinstance(operations_prompt, tk.Label):
-            operations_prompt.config(text=prompt, fg=color)
-
-        if hasattr(self, "master_pulse_label"):
-            self.master_pulse_label.config(text=f"MASTER CONTROL // COMMAND TARGET {label}")
-
-    def _animate_master_control(self) -> None:
-        self.master_pulse_phase = (self.master_pulse_phase + 1) % 12
-        active_red = self.master_pulse_phase in {0, 1, 2}
-        edge = RED if active_red or self.command_target == "ALL" else CYAN
-        title_fg = RED if active_red and self.command_target == "ALL" else TEXT
-
-        if hasattr(self, "top_frame"):
-            self.top_frame.config(highlightbackground=edge)
-        if hasattr(self, "title_label"):
-            self.title_label.config(fg=title_fg)
-        if hasattr(self, "master_pulse_label"):
-            marker = "////" if active_red else "//"
-            self.master_pulse_label.config(
-                fg=edge,
-                text=f"MASTER CONTROL {marker} COMMAND TARGET {self._command_target_label()}",
-            )
-
-        if hasattr(self, "header_hud"):
-            self._render_header_hud(active_red)
-
-        self.after(180, self._animate_master_control)
-
-    def _render_header_hud(self, active_red: bool = False) -> None:
-        canvas = self.header_hud
-        width = max(canvas.winfo_width(), 1)
-        height = max(canvas.winfo_height(), 1)
-        canvas.delete("all")
-        canvas.create_rectangle(0, 0, width, height, fill=PANEL_DARK, outline="")
-        sweep = (self.master_pulse_phase / 12.0) * width
-        canvas.create_line(0, height - 2, width, height - 2, fill=DEEP_RED if active_red else GRID)
-        canvas.create_rectangle(max(0, sweep - 80), 0, sweep, height, fill=DEEP_RED if active_red else "#0a2730", outline="")
-        canvas.create_text(10, 7, anchor="nw", fill=RED if active_red else CYAN, text="LATTICE BUS", font=("Consolas", 9, "bold"))
-        avg_health = self.fleet_history["health"][-1] if self.fleet_history["health"] else 0
-        avg_link = self.fleet_history["link"][-1] if self.fleet_history["link"] else 0
-        risk = self.fleet_history["risk"][-1] if self.fleet_history["risk"] else self.env.risk
-        labels = [("HLT", avg_health, GREEN), ("RF", avg_link, CYAN), ("RISK", risk, RED if risk > 60 else AMBER)]
-        start_x = max(118, width - 288)
-        for index, (label, value, color) in enumerate(labels):
-            x = start_x + index * 92
-            canvas.create_rectangle(x, 6, x + 78, height - 6, outline="#20282c", fill="#020506")
-            fill_w = max(0, min(74, (value / 100.0) * 74))
-            canvas.create_rectangle(x + 2, height - 10, x + 2 + fill_w, height - 7, outline="", fill=color)
-            canvas.create_text(x + 6, 10, anchor="nw", fill=MUTED, text=label, font=("Consolas", 8))
-            canvas.create_text(x + 72, 10, anchor="ne", fill=TEXT, text=f"{value:.0f}", font=("Consolas", 9, "bold"))
 
     def _close_operations_window(self) -> None:
         if self.operations_window is not None:
@@ -1081,569 +726,7 @@ class MastercontrolApp(tk.Tk):
         self.operations_window = None
         self.operations_widgets = {}
 
-    def _on_operations_scope_changed(self, _event=None) -> None:
-        value = getattr(self, "operations_scope_var", tk.StringVar(value="ALL")).get()
-        self.operations_scope = value or "ALL"
-        self._refresh_operations_window()
-
-    def _operations_nodes(self) -> list[Satellite]:
-        if self.operations_scope == "ALL":
-            return list(self.satellites)
-        node = self._find_node(self.operations_scope)
-        return [node] if node is not None else []
-
-    def _start_rangepi_reader(self) -> None:
-        if self.rangepi_running or not self.rangepi_port:
-            return
-
-        self.rangepi_running = True
-        self.link_label.config(text="RANGEPI CONNECTING", fg=AMBER)
-        self.rangepi_thread = threading.Thread(target=self._rangepi_reader_loop, name="rangepi-reader", daemon=True)
-        self.rangepi_thread.start()
-
-    def _rangepi_reader_loop(self) -> None:
-        link = SerialLink(port=self.rangepi_port or "", baudrate=self.rangepi_baud, timeout=0.2)
-        try:
-            link.open()
-            with self.rangepi_lock:
-                self.rangepi_link = link
-            self.rangepi_queue.put(("status", f"RangePi serial open {self.rangepi_port}@{self.rangepi_baud}"))
-
-            while self.rangepi_running:
-                line = link.read_line()
-                if line:
-                    self.rangepi_queue.put(("line", line))
-        except Exception as exc:
-            self.rangepi_queue.put(("error", f"RangePi serial error: {exc}"))
-        finally:
-            with self.rangepi_lock:
-                self.rangepi_link = None
-            try:
-                link.close()
-            except Exception:
-                pass
-            self.rangepi_queue.put(("closed", "RangePi serial bridge closed"))
-
-    def _drain_rangepi_queue(self) -> None:
-        while True:
-            try:
-                kind, payload = self.rangepi_queue.get_nowait()
-            except queue.Empty:
-                return
-
-            if kind == "line" and isinstance(payload, bytes):
-                self._handle_rangepi_line(payload)
-            elif kind == "status":
-                self.link_label.config(text="RANGEPI ONLINE", fg=GREEN)
-                self._write_terminal(str(payload), "info")
-            elif kind == "error":
-                self.link_label.config(text="RANGEPI ERROR", fg=RED)
-                self._write_terminal(str(payload), "bad")
-            elif kind == "closed" and self.rangepi_port:
-                self.link_label.config(text="RANGEPI OFFLINE", fg=AMBER)
-                self._write_terminal(str(payload), "warn")
-
-    def _start_udp_bridge(self) -> None:
-        if self.udp_running:
-            return
-        listen_port = self.udp_listen_port or 5011
-        try:
-            self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self.udp_socket.settimeout(0.2)
-            self.udp_socket.bind(("0.0.0.0", listen_port))
-        except Exception as exc:
-            self.udp_socket = None
-            self._write_terminal(f"Wi-Fi UDP bridge failed to bind port {listen_port}: {exc}", "bad")
-            return
-
-        self.udp_running = True
-        self.udp_thread = threading.Thread(target=self._udp_reader_loop, name="udp-bridge-reader", daemon=True)
-        self.udp_thread.start()
-        target = f"{self.udp_target[0]}:{self.udp_target[1]}" if self.udp_target else "not configured"
-        self._write_terminal(f"Wi-Fi UDP bridge online listen=0.0.0.0:{listen_port} target={target}", "good")
-
-    def _udp_reader_loop(self) -> None:
-        while self.udp_running:
-            sock = self.udp_socket
-            if sock is None:
-                return
-            try:
-                data, addr = sock.recvfrom(512)
-            except socket.timeout:
-                continue
-            except OSError:
-                return
-            if data:
-                self.udp_queue.put((data, addr))
-
-    def _drain_udp_queue(self) -> None:
-        while True:
-            try:
-                data, addr = self.udp_queue.get_nowait()
-            except queue.Empty:
-                return
-            self._handle_udp_datagram(data, addr)
-
-    def _handle_udp_datagram(self, data: bytes, addr: tuple[str, int]) -> None:
-        try:
-            raw_packet = parse_rangepi_line(data)
-            result = self.api.engine.handle_raw_packet(raw_packet)
-            packet = result["packet"]
-        except Exception as exc:
-            self._write_terminal(f"WIFI UDP parse error from {addr[0]}:{addr[1]}: {exc}", "bad")
-            return
-
-        self._write_terminal(
-            f"WIFI UDP RX from {addr[0]}:{addr[1]} type={packet.packet_type} counter={packet.counter}",
-            "info" if result["accepted"] else "bad",
-        )
-        self._dispatch_packet(packet, result, "wifi-rx")
-
-    def _handle_rangepi_line(self, line: bytes) -> None:
-        try:
-            raw_packet = parse_rangepi_line(line)
-            result = self.api.engine.handle_raw_packet(raw_packet)
-            packet = result["packet"]
-        except Exception as exc:
-            self._write_terminal(f"RANGEPI PARSE_ERROR {exc} raw={line[:80]!r}", "bad")
-            return
-
-        self._dispatch_packet(packet, result, "rangepi-rx")
-
-    def _dispatch_packet(self, packet, result: dict, source: str) -> None:
-        source_label = "RANGEPI" if source.startswith("rangepi") else "WIFI"
-
-        if packet.packet_type == HOPE_PACKET_TYPE_ACK:
-            self._handle_ack_packet(packet, result)
-            return
-
-        if packet.packet_type == HOPE_PACKET_TYPE_DIAGNOSTIC:
-            self._handle_diagnostic_packet(packet, result, source)
-            return
-
-        if packet.packet_type == HOPE_PACKET_TYPE_HANDSHAKE:
-            try:
-                fragment = parse_fragment_payload(packet.payload)
-                status = "accepted" if result["accepted"] else "rejected"
-                self._write_terminal(
-                    f"{source_label} LATTICE {message_name(fragment.message_type)} {status} "
-                    f"fragment={fragment.fragment_index + 1}/{fragment.fragment_count} "
-                    f"transfer={fragment.transfer_id} session=0x{packet.session_id:08X}",
-                    "info" if result["accepted"] else "bad",
-                )
-                sat = self._hardware_node_for_packet(packet, None)
-                sat.crypto_state = "LATTICE HANDSHAKE"
-                sat.last_contact_tick = self.tick
-                self._record_packet(sat, "lattice", packet.counter, packet.session_id, status)
-                if result["accepted"]:
-                    responses = self.api.handle_lattice_fragment(sat.name, packet, fragment)
-                    if responses:
-                        self._write_terminal(
-                            f"PQ HANDSHAKE {sat.name} node signature verified; "
-                            f"sending {len(responses)} ground objects",
-                            "good",
-                        )
-                        self._send_lattice_responses(sat, packet.src_id, responses)
-            except PQLatticeError as exc:
-                self._write_terminal(f"PQ handshake not completed: {exc}", "warn")
-            except Exception as exc:
-                self._write_terminal(f"RANGEPI lattice decode failed: {exc}", "bad")
-            return
-
-        if packet.packet_type != HOPE_PACKET_TYPE_TELEMETRY:
-            status = "accepted" if result["accepted"] else "rejected"
-            self._write_terminal(
-                f"{source_label} packet type={packet.packet_type} {status} "
-                f"src={packet.src_id} counter={packet.counter} session=0x{packet.session_id:08X}",
-                "info" if result["accepted"] else "bad",
-            )
-            return
-
-        try:
-            telemetry = parse_telemetry_payload(packet.payload)
-        except Exception as exc:
-            self._write_terminal(f"{source_label} telemetry decode failed: {exc}", "bad")
-            return
-
-        sat = self._hardware_node_for_packet(packet, telemetry)
-        sat.counter = max(sat.counter, packet.counter)
-        sat.fixed_latitude = telemetry.latitude
-        sat.fixed_longitude = telemetry.longitude
-        sat.temperature_c = telemetry.temperature_c
-        sat.satellites_seen = telemetry.satellites
-        sat.session_id = packet.session_id
-        sat.online = True
-        sat.command_state = "RANGEPI"
-        sat.crypto_state = "HARDWARE DOWNLINK"
-        sat.last_contact_tick = self.tick
-
-        status = "accepted" if result["accepted"] else "rejected"
-        if result["accepted"]:
-            self._write_terminal(
-                f"{source_label} RX {sat.name} accepted counter={packet.counter} "
-                f"lat={telemetry.latitude:.4f} lon={telemetry.longitude:.4f} "
-                f"session=0x{packet.session_id:08X}",
-                "info",
-            )
-        else:
-            self.replay_rejects += 1
-            self._write_alert(f"{sat.name} {source_label} replay rejected counter={packet.counter}", "bad")
-
-        self._record_packet(sat, source, packet.counter, packet.session_id, status)
-
-    def _handle_diagnostic_packet(self, packet, result: dict, source: str) -> None:
-        try:
-            diagnostic = parse_diagnostic_payload(packet.payload)
-        except Exception as exc:
-            self._write_terminal(f"RANGEPI diagnostic decode failed: {exc}", "bad")
-            return
-
-        sat = self._hardware_node_for_packet(packet, None)
-        sat.counter = max(sat.counter, packet.counter)
-        sat.session_id = packet.session_id
-        sat.online = True
-        sat.command_state = "SELFTEST"
-        sat.crypto_state = f"SELFTEST {diagnostic_status_name(diagnostic.overall_status)}"
-        sat.boot_count = diagnostic.boot_count
-        sat.last_contact_tick = self.tick
-
-        status = "accepted" if result["accepted"] else "rejected"
-        state = diagnostic_status_name(diagnostic.overall_status)
-        warn = ",".join(diagnostic_mask_names(diagnostic.warning_mask)) or "none"
-        fail = ",".join(diagnostic_mask_names(diagnostic.failed_mask)) or "none"
-
-        if result["accepted"]:
-            sat.last_fault = "none" if diagnostic.failed_mask == 0 else f"selftest fail {fail}"
-            self._write_terminal(
-                f"SELFTEST RX {sat.name} {state} boot={diagnostic.boot_count} "
-                f"i2c_seen={diagnostic.i2c_devices_seen} warn={warn} fail={fail} "
-                f"session=0x{packet.session_id:08X}",
-                "info" if diagnostic.overall_status == 0 else "warn",
-            )
-            if diagnostic.failed_mask:
-                self._write_alert(f"{sat.name} self-test failed: {fail}", "bad")
-            elif diagnostic.warning_mask:
-                self._write_alert(f"{sat.name} self-test warning: {warn}", "warn")
-        else:
-            self.replay_rejects += 1
-            self._write_alert(f"{sat.name} diagnostic replay rejected counter={packet.counter}", "bad")
-
-        self._record_packet(sat, source, packet.counter, packet.session_id, status)
-
-    def _handle_ack_packet(self, packet, result: dict) -> None:
-        try:
-            ack = parse_ack_payload(packet.payload)
-        except Exception as exc:
-            self._write_terminal(f"RANGEPI ACK decode failed: {exc}", "bad")
-            return
-
-        sat = self._hardware_node_for_packet(packet, None)
-        sat.counter = max(sat.counter, packet.counter)
-        sat.session_id = packet.session_id
-        sat.online = True
-        sat.last_contact_tick = self.tick
-
-        record = next((cmd for cmd in self.command_queue if cmd.command_id == ack.command_id), None)
-        ack_name = ack_status_name(ack.status)
-        status = "accepted" if result["accepted"] else "rejected"
-
-        if not result["accepted"]:
-            self.replay_rejects += 1
-            self._write_alert(f"{sat.name} ACK replay rejected counter={packet.counter}", "bad")
-            self._record_packet(sat, "ack", packet.counter, packet.session_id, status)
-            return
-
-        if record is not None:
-            record.status = "acked" if ack.status == 0 else "rejected"
-            record.detail = ack.message or ack_name
-            record.updated_tick = self.tick
-            if ack.status == 0 and record.command in {"arm", "isolate", "connect", "downlink"}:
-                self._apply_node_command(sat, record.command)
-            elif ack.status == 0 and record.command == "rotate":
-                sat.crypto_state = "ROTATE RESERVED"
-            elif ack.status == 0:
-                sat.command_state = record.command.upper()
-            self._record_audit("command", sat.name, "groundstation", record.command, record.status)
-
-        self._write_terminal(
-            f"ACK RX {sat.name} cmd={ack.command_id} status={ack_name} "
-            f"detail={ack.detail_code} msg={ack.message or '-'}",
-            "info" if ack.status == 0 else "warn",
-        )
-        self._record_packet(sat, "ack", packet.counter, packet.session_id, status)
-        self._render_command_queue()
-
-    def _hardware_node_for_packet(self, packet, telemetry=None) -> Satellite:
-        for sat in self.satellites:
-            if sat.session_id == packet.session_id:
-                return sat
-
-        mapped_name = self.rangepi_nodes_by_src.get(packet.src_id)
-        if mapped_name:
-            mapped = self._find_node(mapped_name)
-            if mapped is not None:
-                return mapped
-
-        if telemetry is None:
-            latitude = 37.7749
-            longitude = -122.4194
-            temperature_c = 0.0
-            satellites_seen = 0
-        else:
-            latitude = telemetry.latitude
-            longitude = telemetry.longitude
-            temperature_c = telemetry.temperature_c
-            satellites_seen = telemetry.satellites
-
-        index = len(self.satellites)
-        node = Satellite(
-            f"ESP32-SRC{packet.src_id:02d}",
-            packet.session_id,
-            [CYAN, GREEN, AMBER, MAGENTA, "#b8c2ff"][index % 5],
-            index * 0.7,
-            0.0,
-            "HARDWARE",
-            "HARDWARE DOWNLINK",
-            max(packet.counter, 1),
-            76,
-            satellites_seen,
-            temperature_c,
-            420,
-            300,
-            latitude,
-            longitude,
-            "rangepi-downlink",
-            command_state="RANGEPI",
-        )
-        self._init_node_history(node)
-        self.satellites.append(node)
-        self.rangepi_nodes_by_src[packet.src_id] = node.name
-        self._write_alert(f"RangePi discovered hardware node {node.name} session=0x{packet.session_id:08X}", "info")
-        return node
-
-    def _send_rangepi_command(self, command: str) -> None:
-        if not self.rangepi_port:
-            self._write_command("RangePi bridge is not configured; restart with --rangepi-port COMx", "bad")
-            return
-
-        with self.rangepi_lock:
-            link = self.rangepi_link
-
-        if link is None:
-            self._write_command("RangePi bridge is not connected", "bad")
-            return
-
-        try:
-            link.write_line(command)
-        except Exception as exc:
-            self._write_command(f"RangePi command failed: {exc}", "bad")
-            return
-
-        self._record_audit("rangepi", "operator", "rangepi", command, "sent")
-        self._write_command(f"rangepi> {command}", "info")
-
-    def _has_hardware_link(self) -> bool:
-        return self.rangepi_port is not None or self.udp_target is not None
-
-    def _send_rangepi_packet(self, raw_packet: bytes, label: str) -> bool:
-        if not self.rangepi_port:
-            self._write_command("RangePi bridge is not configured; restart with --rangepi-port COMx", "bad")
-            return False
-
-        with self.rangepi_lock:
-            link = self.rangepi_link
-
-        if link is None:
-            self._write_command("RangePi bridge is not connected", "bad")
-            return False
-
-        command = f"TX {raw_packet.hex().upper()}"
-        try:
-            link.write_line(command)
-        except Exception as exc:
-            self._write_command(f"RangePi packet TX failed: {exc}", "bad")
-            return False
-
-        self._record_audit("rangepi", "groundstation", "lora", label, "sent")
-        self._write_command(f"rangepi-tx> {label} bytes={len(raw_packet)}", "info")
-        return True
-
-    def _send_udp_packet(self, raw_packet: bytes, label: str) -> bool:
-        if self.udp_target is None:
-            self._write_command("Wi-Fi UDP target is not configured; launch with --udp-target-host and --udp-target-port", "bad")
-            return False
-        if self.udp_socket is None:
-            self._start_udp_bridge()
-        if self.udp_socket is None:
-            return False
-        try:
-            self.udp_socket.sendto(raw_packet, self.udp_target)
-        except Exception as exc:
-            self._write_command(f"Wi-Fi UDP TX failed: {exc}", "bad")
-            return False
-
-        self._record_audit("wifi", "groundstation", "udp", label, "sent")
-        self._write_command(f"wifi-tx> {label} bytes={len(raw_packet)} target={self.udp_target[0]}:{self.udp_target[1]}", "info")
-        return True
-
-    def _send_link_packet(self, raw_packet: bytes, label: str) -> bool:
-        if self.ground_transport == "wifi":
-            return self._send_udp_packet(raw_packet, label)
-        if self.rangepi_port:
-            return self._send_rangepi_packet(raw_packet, label)
-        if self.udp_target is not None:
-            return self._send_udp_packet(raw_packet, label)
-        return self._send_rangepi_packet(raw_packet, label)
-
-    def _send_lattice_responses(self, sat: Satellite, dst_id: int, responses: list[LatticeResponse]) -> None:
-        final_session_id = None
-        for response in responses:
-            chunks = fragment_count(len(response.object_bytes))
-            for index in range(chunks):
-                counter = max(self.command_sequence, sat.counter + 1)
-                self.command_sequence = counter + 1
-                raw_packet = encode_handshake_packet(
-                    message_type=response.message_type,
-                    transfer_id=response.transfer_id,
-                    fragment_index=index,
-                    obj=response.object_bytes,
-                    counter=counter,
-                    session_id=response.packet_session_id,
-                    timestamp=int(time.time()),
-                    src_id=2,
-                    dst_id=dst_id,
-                )
-                label = f"pq:{message_name(response.message_type)}:{index + 1}/{chunks}"
-                if not self._send_link_packet(raw_packet, label):
-                    return
-                sat.counter = max(sat.counter, counter)
-                self._record_packet(sat, "pq-tx", counter, response.packet_session_id, "sent")
-            if response.new_session_id is not None:
-                final_session_id = response.new_session_id
-
-        if final_session_id is not None:
-            sat.session_id = final_session_id
-            sat.crypto_state = "PQ SESSION READY"
-            self._write_terminal(
-                f"PQ SESSION {sat.name} ready session=0x{final_session_id:08X}; command auth enabled",
-                "good",
-            )
-
-    def _send_hardware_command_packet(self, sat: Satellite, record: CommandRecord) -> bool:
-        if record.packet_counter == 0:
-            record.packet_counter = max(record.command_id, sat.counter + 1)
-        elif record.attempts > 0:
-            record.packet_counter = max(self.command_sequence, sat.counter + 1, record.packet_counter + 1)
-            self.command_sequence = record.packet_counter + 1
-
-        try:
-            raw_packet = self.api.build_command(
-                sat,
-                record.command_id,
-                record.command,
-                packet_counter=record.packet_counter,
-                arg=record.arg,
-            )
-        except Exception as exc:
-            record.status = "failed"
-            record.detail = str(exc)
-            record.updated_tick = self.tick
-            self._write_command(f"command packet build failed: {exc}", "bad")
-            return False
-
-        if not self._send_link_packet(raw_packet, f"cmd#{record.command_id}:{record.node_name}:{record.command}"):
-            record.status = "failed"
-            record.detail = "radio bridge unavailable"
-            record.updated_tick = self.tick
-            self._render_command_queue()
-            return False
-
-        record.attempts += 1
-        record.status = "sent"
-        record.detail = f"waiting for radio ACK attempt {record.attempts}/{RANGEPI_COMMAND_MAX_ATTEMPTS}"
-        record.updated_tick = self.tick
-        self._record_packet(sat, "cmd-tx", record.packet_counter, sat.session_id, "sent")
-        self._render_command_queue()
-        return True
-
-    def _on_close(self) -> None:
-        self.rangepi_running = False
-        self.udp_running = False
-        if getattr(self.api, "lattice", None) is not None:
-            self.api.lattice.close()
-        with self.rangepi_lock:
-            link = self.rangepi_link
-        if link is not None:
-            try:
-                link.close()
-            except Exception:
-                pass
-        if self.udp_socket is not None:
-            try:
-                self.udp_socket.close()
-            except Exception:
-                pass
-            self.udp_socket = None
-        self.destroy()
-
-    def _scoped_log_text(self, text: str, label: str) -> str:
-        if self.operations_scope == "ALL":
-            return text
-        scope = self.operations_scope.upper()
-        lines = [line for line in text.splitlines() if scope in line.upper()]
-        if lines:
-            return "\n".join(lines) + "\n"
-        return f"[{self.operations_scope}] no scoped {label.lower()} entries yet. Waiting for node traffic.\n"
-
     def _build_operations_mirror_tab(self, name: str, tab: tk.Frame) -> None:
-        if name == "COMMAND":
-            tab.rowconfigure(0, weight=1)
-            tab.rowconfigure(1, weight=0)
-            tab.columnconfigure(0, weight=1)
-            text = tk.Text(tab, bg="#010507", fg=TEXT, highlightthickness=0, bd=0, font=("Consolas", 10), wrap="word", state="disabled")
-            text.tag_config("info", foreground=CYAN)
-            text.tag_config("warn", foreground=AMBER)
-            text.tag_config("bad", foreground=RED)
-            text.tag_config("good", foreground=GREEN)
-            text.grid(row=0, column=0, sticky="nsew")
-
-            command_bar = tk.Frame(tab, bg=PANEL_DARK)
-            command_bar.grid(row=1, column=0, sticky="ew", pady=(8, 0))
-            command_bar.columnconfigure(1, weight=1)
-            prompt = tk.Label(command_bar, text="master[selected]>", bg=PANEL_DARK, fg=CYAN, font=("Consolas", 10))
-            prompt.grid(row=0, column=0, padx=(8, 6), pady=8)
-            entry = tk.Entry(
-                command_bar,
-                bg="#02080b",
-                fg=TEXT,
-                insertbackground=CYAN,
-                relief="flat",
-                font=("Consolas", 10),
-            )
-            entry.grid(row=0, column=1, sticky="ew", pady=8)
-            entry.bind("<Return>", self._run_operations_command)
-            tk.Button(
-                command_bar,
-                text="RUN",
-                command=self._run_operations_command,
-                bg=PANEL,
-                fg=TEXT,
-                activebackground="#12343a",
-                activeforeground=TEXT,
-                highlightbackground="#1c2428",
-                highlightthickness=1,
-                bd=0,
-                padx=12,
-                pady=6,
-                font=("Segoe UI", 9),
-            ).grid(row=0, column=2, padx=8, pady=8)
-
-            self.operations_widgets["COMMAND"] = text
-            self.operations_widgets["COMMAND_PROMPT"] = prompt
-            self.operations_widgets["COMMAND_ENTRY"] = entry
-            self._update_command_prompts()
-            return
-
         if name in {"FEED", "COMMAND", "POSTURE"}:
             text = tk.Text(tab, bg="#010507", fg=TEXT, highlightthickness=0, bd=0, font=("Consolas", 10), wrap="word", state="disabled")
             text.tag_config("info", foreground=CYAN)
@@ -1682,7 +765,7 @@ class MastercontrolApp(tk.Tk):
         if isinstance(feed, tk.Text):
             feed.configure(state="normal")
             feed.delete("1.0", tk.END)
-            feed.insert(tk.END, self._scoped_log_text(self.terminal.get("1.0", tk.END), "feed"))
+            feed.insert(tk.END, self.terminal.get("1.0", tk.END))
             feed.configure(state="disabled")
         posture = self.operations_widgets.get("POSTURE")
         if isinstance(posture, tk.Text):
@@ -1694,62 +777,27 @@ class MastercontrolApp(tk.Tk):
         if isinstance(command, tk.Text):
             command.configure(state="normal")
             command.delete("1.0", tk.END)
-            command.insert(tk.END, self._scoped_log_text(self.command_output.get("1.0", tk.END), "command"))
+            command.insert(tk.END, self.command_output.get("1.0", tk.END))
             command.configure(state="disabled")
         chart = self.operations_widgets.get("CHARTS")
         if isinstance(chart, tk.Canvas):
             self._render_mirror_chart(chart)
 
-        self._refresh_operation_scope_values()
-        self._refresh_operation_tables()
-
-    def _refresh_operation_scope_values(self) -> None:
-        scope = self.operations_widgets.get("scope")
-        if isinstance(scope, ttk.Combobox):
-            values = ["ALL"] + [node.name for node in self.satellites]
-            scope.configure(values=values)
-            if self.operations_scope not in values:
-                self.operations_scope = "ALL"
-                self.operations_scope_var.set("ALL")
-
-    def _refresh_operation_tables(self) -> None:
-        table_rows = {
-            "CONTACTS": [
-                (node.name, self._contact_state(node), f"{self._next_contact_seconds(node)}s", self._contact_reason(node))
-                for node in sorted(self._operations_nodes(), key=self._next_contact_seconds)
-            ],
-            "ALERTS": [
-                (record.alert_id, record.severity, record.status, record.message)
-                for record in reversed(self.alert_records[-120:])
-                if self.operations_scope == "ALL" or self.operations_scope in record.message
-            ],
-            "NODES": [
-                (node.name, node.node_role, node.command_state, f"0x{node.session_id:08X}")
-                for node in self._operations_nodes()
-            ],
-            "QUEUE": [
-                (record.command_id, record.node_name, record.command, record.status, record.detail)
-                for record in reversed(self.command_queue[-120:])
-                if self.operations_scope == "ALL" or record.node_name == self.operations_scope
-            ],
-            "PACKETS": [
-                (record["tick"], record["node"], record["type"], record["counter"], record["session"], record["status"])
-                for record in reversed(self.packet_records[-160:])
-                if self.operations_scope == "ALL" or record["node"] == self.operations_scope
-            ],
-            "AUDIT": [
-                (record.audit_id, record.category, record.actor, record.target, record.action, record.result)
-                for record in reversed(self.audit_records[-160:])
-                if self.operations_scope == "ALL" or record.actor == self.operations_scope or record.target == self.operations_scope
-            ],
+        table_sources = {
+            "CONTACTS": self.schedule_tree,
+            "ALERTS": self.alert_list,
+            "NODES": self.node_list,
+            "QUEUE": self.queue_list,
+            "PACKETS": self.packet_list,
+            "AUDIT": self.audit_list,
         }
-        for name, rows in table_rows.items():
+        for name, source in table_sources.items():
             target = self.operations_widgets.get(name)
             if isinstance(target, ttk.Treeview):
                 for item in target.get_children():
                     target.delete(item)
-                for row in rows:
-                    target.insert("", tk.END, values=row)
+                for item in source.get_children():
+                    target.insert("", tk.END, values=source.item(item, "values"))
 
     def _write_command(self, message: str, tag: str = "") -> None:
         if not hasattr(self, "command_output"):
@@ -1765,52 +813,20 @@ class MastercontrolApp(tk.Tk):
         if not command:
             return
         self.command_entry.delete(0, tk.END)
-        self._execute_command(command)
-
-    def _run_operations_command(self, _event=None) -> None:
-        entry = self.operations_widgets.get("COMMAND_ENTRY")
-        if not isinstance(entry, tk.Entry):
-            return
-        command = entry.get().strip()
-        if not command:
-            return
-        entry.delete(0, tk.END)
-        self._execute_command(command)
-        entry.focus_set()
-
-    def _execute_command(self, command: str) -> None:
-        self._write_command(f"master[{self._command_target_label()}]> {command}", "info")
+        self._write_command(f"mastercontrol> {command}", "info")
 
         parts = command.lower().split()
         if parts[0] == "help":
-            self._write_command("commands: use <all|selected|node|#> | target | nodes | status | pq | transport <lora|wifi|auto|ble> | node | selftest | addnode <name> <role> | delnode <name> | pair pin|kem|manual | rangepi <raw-cmd> | arm | isolate | connect | downlink | rotate | ping | zoomin | zoomout | google | street | track <1-5> | replay | handoff | pause | schedule | sessions", "info")
-        elif parts[0] in ("use", "target", "select"):
-            self._set_command_target(parts[1:] if len(parts) > 1 else [])
-        elif parts[0] in ("nodes", "fleet"):
-            for index, sat in enumerate(self.satellites, start=1):
-                marker = "*" if sat in self._command_target_nodes() else " "
-                self._write_command(f"{marker} {index}: {sat.name} role={sat.node_role} state={sat.command_state} session=0x{sat.session_id:08X}", "info")
+            self._write_command("commands: status | node | addnode <name> <role> | delnode <name> | pair pin|kem|manual | arm | isolate | connect | downlink | rotate | ping | zoomin | zoomout | google | street | track <1-5> | replay | handoff | pause | schedule | sessions", "info")
         elif parts[0] == "status":
-            for sat in self._command_target_nodes():
-                self._write_command(
-                    f"{sat.name}: role={sat.node_role} command={sat.command_state} contact={self._contact_state(sat)} "
-                    f"link={sat.link_margin:.0f}% session=0x{sat.session_id:08X}",
-                    "info",
-                )
-        elif parts[0] in ("pq", "lattice"):
-            tag = "good" if self.api.lattice is not None else "warn"
-            self._write_command(f"PQ backend: {self.api.lattice_status}", tag)
-            self._write_command(f"PQ sessions: {self.api.pq_session_count()}", "good" if self.api.pq_session_count() else "warn")
-            for line in self.api.pq_session_lines():
-                self._write_command(line, "good")
-            for sat in self._command_target_nodes():
-                self._write_command(f"{sat.name}: {self.api.pq_session_state(sat.name, sat.session_id)}", tag)
-        elif parts[0] in ("transport", "link"):
-            self._run_transport_command(parts)
+            sat = self.satellites[self.selected_index]
+            self._write_command(
+                f"{sat.name}: role={sat.node_role} command={sat.command_state} contact={self._contact_state(sat)} "
+                f"link={sat.link_margin:.0f}% session=0x{sat.session_id:08X}",
+                "info",
+            )
         elif parts[0] in ("node", "arm", "isolate", "connect", "downlink", "rotate", "ping"):
             self._run_node_command(parts[0])
-        elif parts[0] in ("selftest", "diag", "diagnostic"):
-            self._run_selftest_command()
         elif parts[0] == "addnode":
             self._add_node_from_command(parts)
         elif parts[0] == "delnode":
@@ -1819,12 +835,6 @@ class MastercontrolApp(tk.Tk):
             self._pair_node_from_command(parts)
         elif parts[0] == "pairwizard":
             self._open_pairing_wizard()
-        elif parts[0] in ("rangepi", "radio"):
-            pieces = command.split(maxsplit=1)
-            if len(pieces) < 2:
-                self._write_command("usage: rangepi <raw command>", "bad")
-            else:
-                self._send_rangepi_command(pieces[1])
         elif parts[0] in ("zoomin", "zoom+"):
             self._zoom_in()
         elif parts[0] in ("zoomout", "zoom-"):
@@ -1832,9 +842,6 @@ class MastercontrolApp(tk.Tk):
         elif parts[0] == "track" and len(parts) > 1 and parts[1].isdigit():
             index = max(1, min(len(self.satellites), int(parts[1]))) - 1
             self.selected_index = index
-            self.map_needs_redraw = True
-            self.command_target = "SELECTED"
-            self._update_command_prompts()
             self._write_command(f"tracking {self.satellites[index].name}", "info")
         elif parts[0] == "replay":
             self._inject_replay()
@@ -1864,92 +871,6 @@ class MastercontrolApp(tk.Tk):
 
         self._render_all()
 
-    def _set_command_target(self, args: list[str]) -> None:
-        if not args:
-            self._write_command(
-                f"target={self._command_target_label()} mode={self.command_target}; use all | use selected | use <node-name> | use <1-{len(self.satellites)}>",
-                "info",
-            )
-            return
-
-        token = args[0].upper()
-        if token == "ALL":
-            self.command_target = "ALL"
-            self._update_command_prompts()
-            self._write_command("command target set to ALL nodes", "warn")
-            return
-
-        if token in {"SELECTED", "CURRENT"}:
-            self.command_target = "SELECTED"
-            self._update_command_prompts()
-            self._write_command(f"command target follows selected node: {self._command_target_label()}", "info")
-            return
-
-        node = self._resolve_node_token(token)
-        if node is None:
-            self._write_command(f"node target not found: {args[0]}; type nodes", "bad")
-            return
-
-        self.selected_index = self.satellites.index(node)
-        self.map_needs_redraw = True
-        self.command_target = node.name
-        self._update_command_prompts()
-        self._write_command(f"command target set to {node.name}", "info")
-
-    def _run_selftest_command(self) -> None:
-        targets = self._command_target_nodes()
-        for sat in targets:
-            if self._has_hardware_link():
-                record = self._enqueue_command(sat, "selftest", "operator requested hardware self-test")
-                if self._send_hardware_command_packet(sat, record):
-                    self._write_command(f"requested {sat.name} hardware self-test over {self.ground_transport} command link", "info")
-                continue
-
-            result = self.api.submit_diagnostic(sat)
-            sat.counter += 1
-            self._handle_diagnostic_packet(result["packet"], result, "selftest-sim")
-        self._write_command(f"self-test dispatched to {len(targets)} target(s)", "info")
-
-    def _run_transport_command(self, parts: list[str]) -> None:
-        if len(parts) < 2:
-            self._write_command(
-                f"ground transport={self.ground_transport}; firmware command: transport lora | wifi | auto | ble",
-                "info",
-            )
-            return
-
-        mode = parts[1].lower()
-        if mode not in {"lora", "wifi", "auto", "ble", "bluetooth"}:
-            self._write_command("transport modes: lora | wifi | auto | ble", "bad")
-            return
-        if mode == "bluetooth":
-            mode = "ble"
-
-        targets = self._command_target_nodes()
-        previous_route = self.ground_transport
-        route_for_command = "wifi" if previous_route == "wifi" else "lora"
-        self.ground_transport = route_for_command
-
-        for sat in targets:
-            record = self._enqueue_command(sat, "transport", f"operator requested transport {mode}", arg=mode)
-            if self._has_hardware_link():
-                if self._send_hardware_command_packet(sat, record):
-                    self._write_command(f"transport {mode} sent to {sat.name} over {route_for_command}", "info")
-            else:
-                self._write_command(f"transport {mode} queued for {sat.name}", "info")
-
-        if mode == "wifi":
-            self.ground_transport = "wifi"
-        elif mode == "lora":
-            self.ground_transport = "lora"
-        elif mode == "auto":
-            self.ground_transport = "lora" if self.rangepi_port else "wifi" if self.udp_target else previous_route
-        else:
-            self.ground_transport = previous_route
-            self._write_command("BLE is reserved in firmware; no local BLE ground link is active yet", "warn")
-
-        self._write_terminal(f"GROUND TRANSPORT route={self.ground_transport} firmware_mode={mode}", "warn")
-
     def _apply_env_command(self, mode: str) -> None:
         if mode == "storm":
             self.env.radiation = 78
@@ -1970,37 +891,23 @@ class MastercontrolApp(tk.Tk):
             self._write_command("env modes: storm | clear | eclipse", "bad")
 
     def _run_node_command(self, command: str) -> None:
-        targets = self._command_target_nodes()
+        sat = self.satellites[self.selected_index]
         if command == "node":
-            for sat in targets:
-                self._write_command(
-                    f"{sat.name} role={sat.node_role} online={sat.online} command={sat.command_state} "
-                    f"crypto={sat.crypto_state} session=0x{sat.session_id:08X}",
-                    "info",
-                )
+            self._write_command(
+                f"{sat.name} role={sat.node_role} online={sat.online} command={sat.command_state} "
+                f"crypto={sat.crypto_state} session=0x{sat.session_id:08X}",
+                "info",
+            )
             return
 
-        for sat in targets:
-            record = self._enqueue_command(sat, command, f"operator issued {command}")
-            if self._has_hardware_link():
-                if self._send_hardware_command_packet(sat, record):
-                    self._write_command(f"{command} sent to {sat.name} over {self.ground_transport} command link", "info")
-                continue
-
-            self._write_command(f"{command} queued for {sat.name}", "info")
-
-        if len(targets) > 1:
-            self._write_command(f"{command} dispatched to {len(targets)} nodes", "warn")
+        self._enqueue_command(sat, command, f"operator issued {command}")
+        self._write_command(f"{command} queued for {sat.name}", "info")
 
     def _apply_node_command(self, sat: Satellite, command: str) -> None:
         if command == "arm":
             sat.command_state = "ARMED"
             sat.state = "READY"
             self._write_terminal(f"SECURE COMMAND arm issued to {sat.name}; ML-DSA authorization accepted", "info")
-        elif command == "transport":
-            sat.command_state = f"LINK-{self.ground_transport.upper()}"
-            sat.state = "LINK SWITCH"
-            self._write_terminal(f"{sat.name} transport route set to {self.ground_transport.upper()}", "warn")
         elif command == "isolate":
             sat.command_state = "ISOLATED"
             sat.online = False
@@ -2063,9 +970,6 @@ class MastercontrolApp(tk.Tk):
         self._init_node_history(node)
         self.satellites.append(node)
         self.selected_index = len(self.satellites) - 1
-        self.map_needs_redraw = True
-        self.command_target = node.name
-        self._update_command_prompts()
         self._write_alert(f"new node staged for pairing: {node.name}", "warn")
         self._render_all()
         return node
@@ -2082,10 +986,6 @@ class MastercontrolApp(tk.Tk):
             if node.name == name:
                 del self.satellites[index]
                 self.selected_index = min(self.selected_index, len(self.satellites) - 1)
-                self.map_needs_redraw = True
-                if self.command_target == name:
-                    self.command_target = "SELECTED"
-                    self._update_command_prompts()
                 self._write_alert(f"node deleted: {name}", "warn")
                 return
         self._write_command(f"node {name} not found", "bad")
@@ -2156,19 +1056,17 @@ class MastercontrolApp(tk.Tk):
         tk.Button(buttons, text="CREATE NODE", command=create, bg=PANEL, fg=TEXT, bd=0, highlightbackground="#1c2428", highlightthickness=1, padx=12, pady=8).pack(side="left")
         tk.Button(buttons, text="CANCEL", command=dialog.destroy, bg=PANEL, fg=TEXT, bd=0, highlightbackground="#1c2428", highlightthickness=1, padx=12, pady=8).pack(side="right")
 
-    def _enqueue_command(self, sat: Satellite, command: str, detail: str, arg: bytes | str = b"") -> CommandRecord:
-        command_id = max(self.command_sequence, sat.counter + 1)
+    def _enqueue_command(self, sat: Satellite, command: str, detail: str) -> CommandRecord:
         record = CommandRecord(
-            command_id=command_id,
+            command_id=self.command_sequence,
             node_name=sat.name,
             command=command,
             status="queued",
             created_tick=self.tick,
             updated_tick=self.tick,
             detail=detail,
-            arg=arg,
         )
-        self.command_sequence = command_id + 1
+        self.command_sequence += 1
         self.command_queue.append(record)
         self._record_audit("command", "operator", sat.name, command, "queued")
         self.ops_tabs.tab(self.queue_tab, text=f"QUEUE ({len([cmd for cmd in self.command_queue if cmd.status in {'queued', 'sent'}])})")
@@ -2183,22 +1081,6 @@ class MastercontrolApp(tk.Tk):
                 self._record_audit("command", "groundstation", record.node_name, record.command, "sent")
                 self._write_terminal(f"CMD#{record.command_id} sent {record.node_name}:{record.command}", "info")
             elif record.status == "sent" and self.tick - record.updated_tick >= 10:
-                if self._has_hardware_link() and record.detail.startswith("waiting for radio ACK"):
-                    node = self._find_node(record.node_name)
-                    if node is not None and record.attempts < RANGEPI_COMMAND_MAX_ATTEMPTS:
-                        self._write_alert(
-                            f"CMD#{record.command_id} retry {record.attempts + 1}/{RANGEPI_COMMAND_MAX_ATTEMPTS} for {record.node_name}",
-                            "warn",
-                        )
-                        self._send_hardware_command_packet(node, record)
-                        continue
-
-                    record.status = "timeout"
-                    record.detail = "radio ACK timeout"
-                    record.updated_tick = self.tick
-                    self._record_audit("command", "groundstation", record.node_name, record.command, "timeout")
-                    self._write_alert(f"CMD#{record.command_id} timeout waiting for RangePi ACK", "warn")
-                    continue
                 node = self._find_node(record.node_name)
                 if node is None:
                     record.status = "failed"
@@ -2461,8 +1343,15 @@ class MastercontrolApp(tk.Tk):
         source_path = self._tile_path(z, x, y)
         styled_path = self._styled_tile_path(z, x, y)
         if not source_path.exists():
-            self._request_tile_download(z, x, y)
-            return None
+            try:
+                source_path.parent.mkdir(parents=True, exist_ok=True)
+                url = OSM_TILE_URL.format(z=z, x=x, y=y)
+                request = Request(url, headers={"User-Agent": "CubeSat-groundstation-demo/0.1"})
+                with urlopen(request, timeout=4) as response:
+                    source_path.write_bytes(response.read())
+            except Exception:
+                self.tile_failures.add(key)
+                return None
 
         if not styled_path.exists():
             try:
@@ -2478,45 +1367,6 @@ class MastercontrolApp(tk.Tk):
 
         self.tile_images[key] = image
         return image
-
-    def _request_tile_download(self, z: int, x: int, y: int) -> None:
-        key = (z, x, y)
-        if key in self.tile_pending_downloads or key in self.tile_failures:
-            return
-
-        self.tile_pending_downloads.add(key)
-
-        def worker() -> None:
-            ok = False
-            try:
-                source_path = self._tile_path(z, x, y)
-                source_path.parent.mkdir(parents=True, exist_ok=True)
-                url = OSM_TILE_URL.format(z=z, x=x, y=y)
-                request = Request(url, headers={"User-Agent": "CubeSat-groundstation-demo/0.1"})
-                with urlopen(request, timeout=2) as response:
-                    source_path.write_bytes(response.read())
-                ok = True
-            except Exception:
-                ok = False
-            finally:
-                self.tile_result_queue.put((key, ok))
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _drain_tile_downloads(self) -> None:
-        changed = False
-        while True:
-            try:
-                key, ok = self.tile_result_queue.get_nowait()
-            except queue.Empty:
-                break
-            self.tile_pending_downloads.discard(key)
-            if ok:
-                changed = True
-            else:
-                self.tile_failures.add(key)
-        if changed:
-            self.map_needs_redraw = True
 
     def _draw_tile_map(self, width: int, height: int) -> bool:
         center_x, center_y = self._latlon_to_world_px(self.map_center_lat, self.map_center_lon, self.map_zoom)
@@ -2651,7 +1501,6 @@ class MastercontrolApp(tk.Tk):
         canvas.create_rectangle(0, 0, width, height, fill=MAP_DARK, outline="")
         if not self._draw_tile_map(width, height):
             self._draw_local_fallback_map(width, height)
-        canvas.create_rectangle(0, 0, width - 1, height - 1, outline="#253039")
 
         gs_x, gs_y = self._map_xy(37.8715, -122.273, width, height)
         pulse = 22 + math.sin(self.tick * 0.08) * 6
@@ -2692,11 +1541,9 @@ class MastercontrolApp(tk.Tk):
                 f"state={selected.command_state} zoom={self.map_zoom}"
             )
         )
-        self.map_needs_redraw = False
-        self.last_map_draw_tick = self.tick
 
     def _render_satellites(self) -> None:
-        self.rendering_sat_list = True
+        previous = self.sat_list.curselection()
         self.sat_list.delete(0, tk.END)
         for sat in self.satellites:
             lat, lon = self._sat_position(sat)
@@ -2710,7 +1557,6 @@ class MastercontrolApp(tk.Tk):
         self.sat_list.selection_clear(0, tk.END)
         self.sat_list.selection_set(self.selected_index)
         self.sat_list.activate(self.selected_index)
-        self.rendering_sat_list = False
 
     def _render_node_inspector(self) -> None:
         sat = self.satellites[self.selected_index]
@@ -2919,8 +1765,8 @@ class MastercontrolApp(tk.Tk):
                     f"replay policy  strictly increasing counters\n"
                     f"last counter   {sat.counter}\n"
                     f"pairing        {'complete' if sat.command_state != 'PAIRING' else 'pending'}\n"
-                    f"auth mode      ML-DSA handshake + HMAC commands\n"
-                    f"kem mode       ML-KEM-512 session exchange\n"
+                    f"auth mode      ML-DSA simulated gate\n"
+                    f"kem mode       ML-KEM adapter boundary\n"
                 ),
             )
             security.configure(state="disabled")
@@ -2930,90 +1776,29 @@ class MastercontrolApp(tk.Tk):
             for record in reversed([cmd for cmd in self.command_queue if cmd.node_name == sat.name][-80:]):
                 history.insert("", tk.END, values=(record.command_id, record.command, record.status, record.detail))
 
-    def _draw_canvas_grid(self, canvas: tk.Canvas, x: int, y: int, width: int, height: int, spacing: int = 24) -> None:
-        for gx in range(x + spacing, x + width, spacing):
-            canvas.create_line(gx, y, gx, y + height, fill=GHOST)
-        for gy in range(y + spacing, y + height, spacing):
-            canvas.create_line(x, gy, x + width, gy, fill=GHOST)
-
-    def _draw_metric_series(
-        self,
-        canvas: tk.Canvas,
-        x: int,
-        y: int,
-        width: int,
-        height: int,
-        values,
-        color: str,
-        label: str,
-        *,
-        fill: bool = False,
-        suffix: str = "",
-        danger_at: float | None = None,
-    ) -> None:
-        canvas.create_rectangle(x, y, x + width, y + height, outline="#20282c", fill="#030506")
-        self._draw_canvas_grid(canvas, x, y, width, height, spacing=max(18, min(34, width // 5)))
-        canvas.create_text(x + 10, y + 8, anchor="nw", fill=MUTED, text=label.upper(), font=("Consolas", 9))
-        if len(values) < 2:
-            return
-
-        low = min(values)
-        high = max(values)
-        if danger_at is not None:
-            high = max(high, danger_at)
-            low = min(low, danger_at)
-        span = max(high - low, 1.0)
-        points = []
-        for index, value in enumerate(values):
-            px = x + 10 + (index / (len(values) - 1)) * (width - 20)
-            py = y + height - 12 - ((value - low) / span) * (height - 34)
-            points.extend((px, py))
-
-        if danger_at is not None and low <= danger_at <= high:
-            danger_y = y + height - 12 - ((danger_at - low) / span) * (height - 34)
-            canvas.create_line(x + 8, danger_y, x + width - 8, danger_y, fill=DEEP_RED, dash=(4, 4))
-
-        if fill and len(points) >= 4:
-            polygon = points[:] + [x + width - 10, y + height - 12, x + 10, y + height - 12]
-            canvas.create_polygon(*polygon, fill=color, stipple="gray75", outline="")
-        canvas.create_line(*points, fill=color, width=2)
-        canvas.create_line(*points, fill="#ffffff", width=1)
-
-        latest = values[-1]
-        value_text = f"{latest:.1f}{suffix}" if isinstance(latest, float) else f"{latest}{suffix}"
-        value_color = RED if danger_at is not None and latest >= danger_at else TEXT
-        canvas.create_text(x + width - 10, y + 8, anchor="ne", fill=value_color, text=value_text, font=("Consolas", 10, "bold"))
-
-    def _draw_radial_gauge(self, canvas: tk.Canvas, cx: int, cy: int, radius: int, value: float, label: str, color: str) -> None:
-        value = max(0.0, min(100.0, value))
-        canvas.create_oval(cx - radius, cy - radius, cx + radius, cy + radius, outline="#20282c", width=2)
-        canvas.create_arc(cx - radius, cy - radius, cx + radius, cy + radius, start=90, extent=-(value / 100.0) * 300, style="arc", outline=color, width=4)
-        canvas.create_oval(cx - radius + 12, cy - radius + 12, cx + radius - 12, cy + radius - 12, outline=GHOST)
-        canvas.create_text(cx, cy - 7, fill=TEXT, text=f"{value:.0f}%", font=("Consolas", 16, "bold"))
-        canvas.create_text(cx, cy + 16, fill=MUTED, text=label.upper(), font=("Consolas", 8))
-
     def _draw_detail_chart(self, canvas: tk.Canvas, sat: Satellite) -> None:
         width = max(canvas.winfo_width(), 1)
         height = max(canvas.winfo_height(), 1)
         canvas.delete("all")
         history = sat.history or {}
-        canvas.create_rectangle(0, 0, width, height, fill="#010507", outline="")
-        canvas.create_text(14, 10, anchor="nw", fill=TEXT, text=f"{sat.name} SENSORBOARD", font=("Consolas", 12, "bold"))
-        self._draw_radial_gauge(canvas, max(76, width - 78), 64, 44, self._node_health_score(sat), "health", GREEN if self._node_health_score(sat) >= 80 else AMBER)
-
-        chart_w = max(150, (width - 42) // 3)
-        chart_h = max(92, (height - 94) // 2)
-        y0 = 86
-        self._draw_metric_series(canvas, 12, y0, chart_w, chart_h, list(history.get("link", [])), GREEN, "RF link margin", fill=True, suffix="%")
-        self._draw_metric_series(canvas, 22 + chart_w, y0, chart_w, chart_h, list(history.get("temp", [])), CYAN, "thermal", suffix="C", danger_at=31)
-        self._draw_metric_series(canvas, 32 + chart_w * 2, y0, chart_w, chart_h, list(history.get("battery", [])), AMBER, "battery bus", fill=True, suffix="%")
-        y1 = y0 + chart_h + 14
-        self._draw_metric_series(canvas, 12, y1, chart_w, chart_h, list(history.get("loss", [])), RED, "packet loss", suffix="%", danger_at=8)
-        self._draw_metric_series(canvas, 22 + chart_w, y1, chart_w, chart_h, list(history.get("gas", [])), MAGENTA, "gas co2", suffix="ppm", danger_at=480)
-        self._draw_metric_series(canvas, 32 + chart_w * 2, y1, chart_w, chart_h, list(history.get("radiation", [])), "#b8c2ff", "radiation", suffix="cpm", danger_at=38)
+        self._draw_chart_on(canvas, 12, 28, max(120, width - 24), max(80, (height - 64) // 2), list(history.get("link", [])), GREEN, "link margin")
+        self._draw_chart_on(canvas, 12, 48 + ((height - 64) // 2), max(120, width - 24), max(80, (height - 64) // 2), list(history.get("battery", [])), AMBER, "battery")
 
     def _draw_chart_on(self, canvas: tk.Canvas, x: int, y: int, width: int, height: int, values, color: str, label: str) -> None:
-        self._draw_metric_series(canvas, x, y, width, height, values, color, label, fill=False)
+        canvas.create_rectangle(x, y, x + width, y + height, outline="#20282c", fill="#030506")
+        canvas.create_text(x + 10, y + 9, anchor="nw", fill=MUTED, text=label.upper(), font=("Consolas", 9))
+        if len(values) < 2:
+            return
+        low = min(values)
+        high = max(values)
+        span = max(high - low, 1.0)
+        points = []
+        for index, value in enumerate(values):
+            px = x + 10 + (index / (len(values) - 1)) * (width - 20)
+            py = y + height - 12 - ((value - low) / span) * (height - 32)
+            points.extend((px, py))
+        canvas.create_line(*points, fill=color, width=2)
+        canvas.create_text(x + width - 10, y + 9, anchor="ne", fill=TEXT, text=f"{values[-1]:.1f}", font=("Consolas", 10, "bold"))
 
     def _render_state(self) -> None:
         accepted = sum(sat.counter for sat in self.satellites)
@@ -3023,42 +1808,9 @@ class MastercontrolApp(tk.Tk):
         self.state_labels["Replay Rejects"].config(text=str(self.replay_rejects))
         self.state_labels["Average Link"].config(text=f"{avg_link:.0f}%")
         self.state_labels["Ground Mode"].config(text="LIVE" if self.running else "HOLD")
-        pq_sessions = self.api.pq_session_count()
-        if self.api.lattice is None:
-            pq_text = "PQ OFF"
-            pq_color = AMBER
-        elif pq_sessions:
-            pq_text = f"PQ {pq_sessions} SESS"
-            pq_color = GREEN
-        else:
-            pq_text = "PQ READY"
-            pq_color = CYAN
-        self.state_labels["PQ Lattice"].config(text=pq_text, fg=pq_color)
+        self.state_labels["Lattice Layer"].config(text=f"RISK {self.env.risk:.0f}%")
         self.state_labels["LoRa Channel"].config(text=f"{open_contacts} OPEN")
-        self._render_fleet_graphs()
         self._refresh_mission_summary()
-
-    def _render_fleet_graphs(self) -> None:
-        if not hasattr(self, "fleet_graph_canvas"):
-            return
-        canvas = self.fleet_graph_canvas
-        width = max(canvas.winfo_width(), 1)
-        height = max(canvas.winfo_height(), 1)
-        canvas.delete("all")
-        canvas.create_rectangle(0, 0, width, height, fill="#010507", outline="")
-        canvas.create_line(0, 0, width, 0, fill=DEEP_RED)
-        canvas.create_text(10, 8, anchor="nw", fill=TEXT, text="FLEET TELEMETRY", font=("Consolas", 10, "bold"))
-
-        gauge_y = 58
-        self._draw_radial_gauge(canvas, 52, gauge_y, 34, self.fleet_history["health"][-1] if self.fleet_history["health"] else 0, "health", GREEN)
-        self._draw_radial_gauge(canvas, 132, gauge_y, 34, self.fleet_history["link"][-1] if self.fleet_history["link"] else 0, "link", CYAN)
-        self._draw_radial_gauge(canvas, 212, gauge_y, 34, max(0, 100 - (self.fleet_history["risk"][-1] if self.fleet_history["risk"] else 0)), "risk", RED if self.env.risk > 60 else AMBER)
-
-        graph_top = 106
-        graph_h = max(60, height - graph_top - 10)
-        graph_w = max(120, (width - 30) // 2)
-        self._draw_metric_series(canvas, 10, graph_top, graph_w, graph_h, list(self.fleet_history["packets"]), GREEN, "frames", fill=True)
-        self._draw_metric_series(canvas, 20 + graph_w, graph_top, graph_w, graph_h, list(self.fleet_history["loss"]), RED, "loss", suffix="%", danger_at=7)
 
     def _refresh_mission_summary(self) -> None:
         if not hasattr(self, "summary_text"):
@@ -3067,16 +1819,12 @@ class MastercontrolApp(tk.Tk):
         open_alerts = len([alert for alert in self.alert_records if alert.status == "open"])
         pending_commands = len([cmd for cmd in self.command_queue if cmd.status in {"queued", "sent"}])
         recent_packets = len(self.packet_records[-20:])
-        pq_backend = "PC OQS READY" if self.api.lattice is not None else "OFFLINE"
-        pq_session = self.api.pq_session_state(selected.name, selected.session_id)
         lines = [
             ("MISSION SUMMARY\n\n", "info"),
             (f"selected node     {selected.name}\n", ""),
             (f"health score      {self._node_health_score(selected)}%\n", "good" if self._node_health_score(selected) >= 80 else "warn"),
             (f"session           0x{selected.session_id:08X}\n", ""),
             (f"crypto            {selected.crypto_state}\n", "good" if "STANDBY" not in selected.crypto_state else "warn"),
-            (f"pq backend        {pq_backend}\n", "good" if self.api.lattice is not None else "warn"),
-            (f"pq session        {pq_session}\n", "good" if pq_session == "SESSION AUTH" else "warn"),
             (f"link margin       {selected.link_margin:.0f}%\n", "good" if selected.link_margin >= 70 else "warn"),
             (f"battery           {selected.battery_percent:.1f}%\n\n", "good" if selected.battery_percent >= 70 else "warn"),
             ("OPS\n", "info"),
@@ -3118,7 +1866,7 @@ class MastercontrolApp(tk.Tk):
             (f"contact risk         {self.env.risk:5.1f}%\n\n", "bad" if self.env.risk > 70 else "warn" if self.env.risk > 45 else "good"),
             ("SMART ROUTER\n", "info"),
             ("open windows require: above horizon, link margin >=42%, risk <=70%\n", ""),
-            ("commands: help, status, pq, node, addnode, delnode, pair, pairwizard, arm, isolate, connect, downlink, rotate, ping, zoomin, zoomout, google, street, track <1-5>\n", ""),
+            ("commands: help, status, node, addnode, delnode, pair, pairwizard, arm, isolate, connect, downlink, rotate, ping, zoomin, zoomout, google, street, track <1-5>\n", ""),
         ]
         self.env_text.configure(state="normal")
         self.env_text.delete("1.0", tk.END)
@@ -3153,21 +1901,18 @@ class MastercontrolApp(tk.Tk):
         open_alerts = len([alert for alert in self.alert_records if alert.status == "open"])
         rejected_packets = len([packet for packet in self.packet_records if packet["status"] != "accepted"])
         avg_health = sum(self._node_health_score(node) for node in self.satellites) / max(1, len(self.satellites))
-        pq_sessions = self.api.pq_session_count()
 
         rows = [
             ("SECURITY POSTURE\n\n", "info"),
             (f"mesh online        {online}/{len(self.satellites)} nodes\n", "good" if online == len(self.satellites) else "warn"),
             (f"paired nodes       {paired}/{len(self.satellites)} nodes\n", "good" if paired == len(self.satellites) else "warn"),
-            (f"pq backend         {self.api.lattice_status}\n", "good" if self.api.lattice is not None else "warn"),
-            (f"pq sessions        {pq_sessions}\n", "good" if pq_sessions else "warn"),
             (f"avg health         {avg_health:5.1f}%\n", "good" if avg_health >= 80 else "warn" if avg_health >= 55 else "bad"),
             (f"pending commands   {pending_commands}\n", "warn" if pending_commands else "good"),
             (f"open alerts        {open_alerts}\n", "bad" if open_alerts else "good"),
             (f"rejected packets   {rejected_packets}\n\n", "warn" if rejected_packets else "good"),
             ("POLICY\n", "info"),
-            ("command auth       ML-KEM-derived HMAC tag\n", ""),
-            ("session exchange   ML-KEM-512 + ML-DSA-44\n", ""),
+            ("command auth       simulated ML-DSA gate\n", ""),
+            ("session exchange   ML-KEM adapter boundary\n", ""),
             ("replay filter      strict per-session monotonic counters\n", ""),
             ("audit logging      command lifecycle + security events\n\n", ""),
             ("NODE HEALTH\n", "info"),
@@ -3184,7 +1929,20 @@ class MastercontrolApp(tk.Tk):
         self.posture_text.configure(state="disabled")
 
     def _draw_series(self, x: int, y: int, width: int, height: int, values, color: str, label: str) -> None:
-        self._draw_metric_series(self.chart_canvas, x, y, width, height, values, color, label, fill=True)
+        self.chart_canvas.create_rectangle(x, y, x + width, y + height, outline="#20282c", fill="#030506")
+        self.chart_canvas.create_text(x + 10, y + 10, anchor="nw", fill=MUTED, text=label.upper(), font=("Consolas", 9))
+        if len(values) < 2:
+            return
+        min_value = min(values)
+        max_value = max(values)
+        span = max(max_value - min_value, 1.0)
+        points = []
+        for index, value in enumerate(values):
+            px = x + 10 + (index / (len(values) - 1)) * (width - 20)
+            py = y + height - 14 - ((value - min_value) / span) * (height - 34)
+            points.extend((px, py))
+        self.chart_canvas.create_line(*points, fill=color, width=2)
+        self.chart_canvas.create_text(x + width - 10, y + 10, anchor="ne", fill=TEXT, text=f"{values[-1]:.1f}", font=("Consolas", 10, "bold"))
 
     def _render_charts(self) -> None:
         if not hasattr(self, "chart_canvas"):
@@ -3194,57 +1952,27 @@ class MastercontrolApp(tk.Tk):
         width = max(self.chart_canvas.winfo_width(), 1)
         height = max(self.chart_canvas.winfo_height(), 1)
         self.chart_canvas.delete("all")
-        self.chart_canvas.create_rectangle(0, 0, width, height, fill="#010507", outline="")
         self.chart_canvas.create_text(12, 10, anchor="nw", fill=TEXT, text=f"{sat.name} LIVE METRICS", font=("Consolas", 11, "bold"))
-        self.chart_canvas.create_text(width - 12, 10, anchor="ne", fill=RED, text="ANALYTICS BUS / LIVE", font=("Consolas", 9, "bold"))
-        chart_w = max(140, (width - 48) // 3)
-        chart_h = max(86, (height - 66) // 2)
-        y0 = 38
-        self._draw_metric_series(self.chart_canvas, 12, y0, chart_w, chart_h, list(history.get("temp", [])), CYAN, "temperature", suffix="C", danger_at=31)
-        self._draw_metric_series(self.chart_canvas, 24 + chart_w, y0, chart_w, chart_h, list(history.get("link", [])), GREEN, "link margin", fill=True, suffix="%")
-        self._draw_metric_series(self.chart_canvas, 36 + chart_w * 2, y0, chart_w, chart_h, list(history.get("battery", [])), AMBER, "battery", suffix="%")
-        y1 = y0 + chart_h + 12
-        self._draw_metric_series(self.chart_canvas, 12, y1, chart_w, chart_h, list(history.get("loss", [])), RED, "packet loss", suffix="%", danger_at=8)
-        self._draw_metric_series(self.chart_canvas, 24 + chart_w, y1, chart_w, chart_h, list(history.get("gas", [])), MAGENTA, "gas sensor", suffix="ppm", danger_at=480)
-        self._draw_metric_series(self.chart_canvas, 36 + chart_w * 2, y1, chart_w, chart_h, list(history.get("radiation", [])), "#b8c2ff", "radiation", suffix="cpm", danger_at=38)
+        chart_w = max(160, (width - 36) // 2)
+        chart_h = max(88, (height - 54) // 2)
+        self._draw_series(12, 38, chart_w, chart_h, list(history.get("temp", [])), CYAN, "temperature c")
+        self._draw_series(24 + chart_w, 38, chart_w, chart_h, list(history.get("link", [])), GREEN, "link margin")
+        self._draw_series(12, 50 + chart_h, chart_w, chart_h, list(history.get("battery", [])), AMBER, "battery")
+        self._draw_series(24 + chart_w, 50 + chart_h, chart_w, chart_h, list(history.get("loss", [])), MAGENTA, "packet loss")
 
     def _render_mirror_chart(self, canvas: tk.Canvas) -> None:
+        sat = self.satellites[self.selected_index]
+        history = sat.history or {}
         width = max(canvas.winfo_width(), 1)
         height = max(canvas.winfo_height(), 1)
         canvas.delete("all")
-        if self.operations_scope != "ALL":
-            node = self._find_node(self.operations_scope) or self.satellites[self.selected_index]
-            history = node.history or {}
-            canvas.create_text(12, 10, anchor="nw", fill=TEXT, text=f"{node.name} OPERATIONS METRICS", font=("Consolas", 11, "bold"))
-            chart_w = max(160, (width - 48) // 3)
-            chart_h = max(100, (height - 66) // 2)
-            y0 = 38
-            self._draw_metric_series(canvas, 12, y0, chart_w, chart_h, list(history.get("temp", [])), CYAN, "temperature", suffix="C", danger_at=31)
-            self._draw_metric_series(canvas, 24 + chart_w, y0, chart_w, chart_h, list(history.get("link", [])), GREEN, "link margin", fill=True, suffix="%")
-            self._draw_metric_series(canvas, 36 + chart_w * 2, y0, chart_w, chart_h, list(history.get("battery", [])), AMBER, "battery", suffix="%")
-            y1 = y0 + chart_h + 12
-            self._draw_metric_series(canvas, 12, y1, chart_w, chart_h, list(history.get("loss", [])), RED, "packet loss", suffix="%", danger_at=8)
-            self._draw_metric_series(canvas, 24 + chart_w, y1, chart_w, chart_h, list(history.get("gas", [])), MAGENTA, "gas sensor", suffix="ppm", danger_at=480)
-            self._draw_metric_series(canvas, 36 + chart_w * 2, y1, chart_w, chart_h, list(history.get("radiation", [])), "#b8c2ff", "radiation", suffix="cpm", danger_at=38)
-            return
-
-        canvas.create_text(12, 10, anchor="nw", fill=TEXT, text="FLEET HEALTH OVERVIEW", font=("Consolas", 11, "bold"))
-        side_x = min(max(300, width // 2), max(12, width - 180))
-        side_w = max(160, width - side_x - 18)
-        self._draw_metric_series(canvas, side_x, 38, side_w, 110, list(self.fleet_history["risk"]), RED, "contact risk", fill=True, suffix="%", danger_at=65)
-        self._draw_metric_series(canvas, side_x, 164, side_w, 110, list(self.fleet_history["link"]), CYAN, "fleet link", fill=True, suffix="%")
-        bar_top = 44
-        bar_h = 24
-        gap = 14
-        for index, node in enumerate(self.satellites):
-            y = bar_top + index * (bar_h + gap)
-            score = self._node_health_score(node)
-            canvas.create_text(14, y + 3, anchor="nw", fill=TEXT, text=node.name, font=("Consolas", 10))
-            canvas.create_rectangle(180, y, max(181, width - 28), y + bar_h, outline="#20282c", fill="#030506")
-            fill_w = (width - 210) * (score / 100)
-            color = GREEN if score >= 80 else AMBER if score >= 55 else RED
-            canvas.create_rectangle(180, y, 180 + fill_w, y + bar_h, outline="", fill=color)
-            canvas.create_text(width - 18, y + 3, anchor="ne", fill=TEXT, text=f"{score}%", font=("Consolas", 10, "bold"))
+        canvas.create_text(12, 10, anchor="nw", fill=TEXT, text=f"{sat.name} OPERATIONS METRICS", font=("Consolas", 11, "bold"))
+        chart_w = max(180, (width - 36) // 2)
+        chart_h = max(110, (height - 54) // 2)
+        self._draw_chart_on(canvas, 12, 38, chart_w, chart_h, list(history.get("temp", [])), CYAN, "temperature")
+        self._draw_chart_on(canvas, 24 + chart_w, 38, chart_w, chart_h, list(history.get("link", [])), GREEN, "link margin")
+        self._draw_chart_on(canvas, 12, 50 + chart_h, chart_w, chart_h, list(history.get("battery", [])), AMBER, "battery")
+        self._draw_chart_on(canvas, 24 + chart_w, 50 + chart_h, chart_w, chart_h, list(history.get("loss", [])), MAGENTA, "packet loss")
 
     def _render_nodes_table(self) -> None:
         if not hasattr(self, "node_list"):
@@ -3258,18 +1986,8 @@ class MastercontrolApp(tk.Tk):
                 values=(sat.name, sat.node_role, sat.command_state, f"0x{sat.session_id:08X}"),
             )
 
-    def _render_map_if_needed(self, force: bool = False) -> None:
-        if (
-            force
-            or self.map_needs_redraw
-            or (self.tick - self.last_map_draw_tick) >= self.map_min_redraw_ticks
-        ):
-            self._draw_map()
-            self.map_needs_redraw = False
-            self.last_map_draw_tick = self.tick
-
     def _render_all(self) -> None:
-        self._render_map_if_needed()
+        self._draw_map()
         self._render_satellites()
         self._render_node_inspector()
         self._render_state()
@@ -3281,19 +1999,11 @@ class MastercontrolApp(tk.Tk):
         self._render_packet_log()
         self._render_audit_log()
         self._render_security_posture()
-        self._update_command_prompts()
-        self._refresh_operations_window()
 
     def _select_satellite(self, _event=None) -> None:
-        if self.rendering_sat_list:
-            return
         selection = self.sat_list.curselection()
         if selection:
             self.selected_index = selection[0]
-            if self.command_target != "ALL":
-                self.command_target = "SELECTED"
-                self._update_command_prompts()
-            self.map_needs_redraw = True
             sat = self.satellites[self.selected_index]
             self._write_terminal(f"TARGET LOCK {sat.name} session=0x{sat.session_id:08X}", "info")
             self._open_node_detail_window()
@@ -3322,31 +2032,9 @@ class MastercontrolApp(tk.Tk):
         if self.hover_satellite is None:
             return
         self.selected_index = self.satellites.index(self.hover_satellite)
-        if self.command_target != "ALL":
-            self.command_target = "SELECTED"
-            self._update_command_prompts()
-        self.map_needs_redraw = True
         self._write_terminal(f"MAP SELECT {self.hover_satellite.name} session=0x{self.hover_satellite.session_id:08X}", "info")
         self._open_node_detail_window()
         self._render_all()
-
-    def _on_map_pan_start(self, event) -> None:
-        self.pan_start = (event.x, event.y, self.map_center_lat, self.map_center_lon)
-        self.map_canvas.configure(cursor="fleur")
-
-    def _on_map_pan_drag(self, event) -> None:
-        if self.pan_start is None:
-            return
-        start_x, start_y, start_lat, start_lon = self.pan_start
-        center_x, center_y = self._latlon_to_world_px(start_lat, start_lon, self.map_zoom)
-        new_center_x = center_x - (event.x - start_x)
-        new_center_y = center_y - (event.y - start_y)
-        self.map_center_lat, self.map_center_lon = self._world_px_to_latlon(new_center_x, new_center_y, self.map_zoom)
-        self._schedule_map_redraw()
-
-    def _on_map_pan_end(self, _event=None) -> None:
-        self.pan_start = None
-        self.map_canvas.configure(cursor="")
 
     def _on_map_double_click(self, _event=None) -> None:
         if self.hover_satellite is None:
@@ -3358,17 +2046,12 @@ class MastercontrolApp(tk.Tk):
             self.map_zoom = self.map_overview_zoom
             self.map_center_lat = 37.82
             self.map_center_lon = -122.28
-            self.map_needs_redraw = True
             self._write_terminal("MAP overview restored", "info")
         else:
             self.selected_index = self.satellites.index(self.hover_satellite)
-            if self.command_target != "ALL":
-                self.command_target = "SELECTED"
-                self._update_command_prompts()
             self.map_focused_satellite = self.hover_satellite
             self.map_zoom = self.map_detail_zoom
             self.map_center_lat, self.map_center_lon = self._sat_position(self.hover_satellite)
-            self.map_needs_redraw = True
             self._write_terminal(f"MAP detail focus {self.hover_satellite.name}", "info")
 
         self._render_all()
@@ -3407,14 +2090,13 @@ class MastercontrolApp(tk.Tk):
         self._schedule_map_redraw()
 
     def _schedule_map_redraw(self) -> None:
-        self.map_needs_redraw = True
         if self.map_redraw_after_id is not None:
             self.after_cancel(self.map_redraw_after_id)
-        self.map_redraw_after_id = self.after(16, self._finish_map_redraw)
+        self.map_redraw_after_id = self.after(55, self._finish_map_redraw)
 
     def _finish_map_redraw(self) -> None:
         self.map_redraw_after_id = None
-        self._render_map_if_needed(force=True)
+        self._render_all()
 
     def _write_terminal(self, message: str, tag: str = "") -> None:
         stamp = time.strftime("%H:%M:%S")
@@ -3471,15 +2153,27 @@ class MastercontrolApp(tk.Tk):
 
     def _force_handoff(self) -> None:
         self.selected_index = (self.selected_index + 1) % len(self.satellites)
-        self.map_needs_redraw = True
-        if self.command_target != "ALL":
-            self.command_target = "SELECTED"
-            self._update_command_prompts()
         sat = self.satellites[self.selected_index]
         self._write_terminal(f"HANDOFF complete; active target {sat.name}", "info")
         self._render_all()
 
-    def _simulate_node_rx(self, sat: Satellite) -> None:
+    def _generate_terminal_event(self) -> None:
+        open_sats = [sat for sat in self.satellites if self._contact_state(sat) == "OPEN"]
+        if not open_sats:
+            wait_sat = min(self.satellites, key=self._next_contact_seconds)
+            self._write_terminal(
+                f"CONTACT SCHEDULER hold: next={wait_sat.name} in {self._next_contact_seconds(wait_sat)}s "
+                f"reason={self._contact_reason(wait_sat)} risk={self.env.risk:.0f}%",
+                "warn",
+            )
+            self.after(900, self._generate_terminal_event)
+            return
+
+        sat = self.satellites[self.selected_index] if self.satellites[self.selected_index] in open_sats else open_sats[0]
+        if not sat.online:
+            self._write_terminal(f"{sat.name} offline; command channel held", "warn")
+            self.after(1200, self._generate_terminal_event)
+            return
         lat, lon = self._sat_position(sat)
         result = self.api.submit_telemetry(sat, lat, lon)
         telemetry = result["telemetry"]
@@ -3498,40 +2192,12 @@ class MastercontrolApp(tk.Tk):
             self._record_packet(sat, "telemetry", result["packet"].counter, sat.session_id, "rejected")
             self._write_alert(f"{sat.name} replay rejected counter={result['packet'].counter}", "bad")
 
-        if random.random() < 0.18:
+        if random.random() < 0.25:
             self._write_terminal(f"ML-KEM {sat.name} state={sat.crypto_state}; auth lane nominal; contact window adaptive")
-
-    def _generate_terminal_event(self) -> None:
-        open_sats = [sat for sat in self.satellites if self._contact_state(sat) == "OPEN"]
-        if not open_sats:
-            wait_sat = min(self.satellites, key=self._next_contact_seconds)
-            self._write_terminal(
-                f"CONTACT SCHEDULER hold: next={wait_sat.name} in {self._next_contact_seconds(wait_sat)}s "
-                f"reason={self._contact_reason(wait_sat)} risk={self.env.risk:.0f}%",
-                "warn",
-            )
-            self.after(900, self._generate_terminal_event)
-            return
-
-        online_open_sats = [sat for sat in open_sats if sat.online]
-        if not online_open_sats:
-            held_names = ", ".join(sat.name for sat in open_sats[:3])
-            self._write_terminal(f"CONTACT SCHEDULER hold: open contacts offline ({held_names})", "warn")
-            self.after(1200, self._generate_terminal_event)
-            return
-
-        batch_size = min(2, len(online_open_sats))
-        for offset in range(batch_size):
-            sat = online_open_sats[(self.telemetry_cursor + offset) % len(online_open_sats)]
-            self._simulate_node_rx(sat)
-        self.telemetry_cursor = (self.telemetry_cursor + batch_size) % len(online_open_sats)
 
         self.after(900, self._generate_terminal_event)
 
     def _loop(self) -> None:
-        self._drain_rangepi_queue()
-        self._drain_udp_queue()
-        self._drain_tile_downloads()
         if self.running:
             self.tick += 1
             self._process_command_queue()
@@ -3580,37 +2246,13 @@ class MastercontrolApp(tk.Tk):
                     sat.state = "DOWNLINK"
                 else:
                     sat.state = "TRACK"
-            self._append_fleet_history()
 
         self._render_all()
         self.after(90, self._loop)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="CubeSat Control dashboard")
-    parser.add_argument("--list-ports", action="store_true", help="List serial ports and exit")
-    parser.add_argument("--rangepi-port", help="RangePi serial port, e.g. COM5 or /dev/ttyUSB0")
-    parser.add_argument("--baud", type=int, default=115200, help="RangePi serial baud rate")
-    parser.add_argument("--udp-listen", type=int, help="Wi-Fi backup UDP listen port, default 5011 when UDP target is set")
-    parser.add_argument("--udp-target-host", help="ESP32 Wi-Fi backup target IPv4 address")
-    parser.add_argument("--udp-target-port", type=int, default=5010, help="ESP32 Wi-Fi backup command UDP port")
-    parser.add_argument("--no-sim", action="store_true", help="Disable fake telemetry and wait for RangePi packets")
-    args = parser.parse_args()
-
-    if args.list_ports:
-        from groundstation.tools.list_serial_ports import print_serial_ports
-
-        print_serial_ports()
-        return
-
-    app = MastercontrolApp(
-        rangepi_port=args.rangepi_port,
-        rangepi_baud=args.baud,
-        simulate=not args.no_sim,
-        udp_listen_port=args.udp_listen if args.udp_listen is not None else (5011 if args.udp_target_host else None),
-        udp_target_host=args.udp_target_host,
-        udp_target_port=args.udp_target_port,
-    )
+    app = MastercontrolApp()
     app.mainloop()
 
 

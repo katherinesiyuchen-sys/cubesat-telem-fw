@@ -24,6 +24,7 @@ typedef enum {
     COMMAND_OPCODE_CONNECT = 9,
     COMMAND_OPCODE_ARM = 10,
     COMMAND_OPCODE_SET_TRANSPORT = 11,
+    COMMAND_OPCODE_SET_CADENCE = 12,
 } command_opcode_t;
 
 typedef enum {

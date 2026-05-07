@@ -69,6 +69,14 @@ def encode_telemetry_packet(
     temperature_c: float,
     fix_type: int = 3,
     satellites: int = 8,
+    altitude_m: float = 0.0,
+    hdop: float = 0.0,
+    speed_mps: float = 0.0,
+    course_deg: float = 0.0,
+    fix_age_ms: int = 0,
+    utc_time_ms: int = 0,
+    utc_date_ddmmyy: int = 0,
+    gnss_flags: int = 0x07,
     session_id: int = 0x12345678,
     timestamp: int = 0,
     src_id: int = 1,
@@ -80,6 +88,14 @@ def encode_telemetry_packet(
         temperature_c=temperature_c,
         fix_type=fix_type,
         satellites=satellites,
+        altitude_m=altitude_m,
+        hdop=hdop,
+        speed_mps=speed_mps,
+        course_deg=course_deg,
+        fix_age_ms=fix_age_ms,
+        utc_time_ms=utc_time_ms,
+        utc_date_ddmmyy=utc_date_ddmmyy,
+        gnss_flags=gnss_flags,
     )
 
     header = struct.pack(
@@ -105,6 +121,10 @@ def encode_fake_packet(counter: int = 1) -> bytes:
         temperature_c=24.5,
         fix_type=3,
         satellites=8,
+        altitude_m=11.0,
+        hdop=0.9,
+        utc_time_ms=45319000,
+        utc_date_ddmmyy=10626,
     )
 
 

@@ -1,5 +1,7 @@
 {
     "recommendations": [
-        "openai.chatgpt"
+        "openai.chatgpt",
+        "ms-vscode.cpptools",
+        "espressif.esp-idf-extension"
     ]
 }

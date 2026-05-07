@@ -1,5 +1,8 @@
 param(
-    [int]$Baud = 115200
+    [int]$Baud = 115200,
+    [int]$Port = 8765,
+    [switch]$NoBrowser,
+    [switch]$Classic
 )
 
 $ErrorActionPreference = "Stop"
@@ -11,4 +14,12 @@ if (-not (Test-Path -LiteralPath $Python)) {
 }
 
 $env:PYTHONPATH = [string]$RepoRoot
-& $Python -m groundstation.ui.mastercontrol_app --rangepi-port sim://cubesat --baud $Baud --no-sim
+if ($Classic) {
+    & $Python -m groundstation.ui.mastercontrol_app --rangepi-port sim://cubesat --baud $Baud --no-sim
+} else {
+    $argsList = @("-m", "groundstation.ui.mastercontrol_web", "--rangepi-port", "sim://cubesat", "--baud", [string]$Baud, "--port", [string]$Port)
+    if ($NoBrowser) {
+        $argsList += "--no-browser"
+    }
+    & $Python @argsList
+}

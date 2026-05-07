@@ -21,6 +21,8 @@ def assert_default_fake_packet() -> None:
     print(f"  longitude:  {telemetry.longitude:.7f}")
     print(f"  temp:       {telemetry.temperature_c:.1f}C")
     print(f"  fix/sats:   {telemetry.fix_type}/{telemetry.satellites}")
+    print(f"  alt/hdop:   {telemetry.altitude_m:.1f}m/{telemetry.hdop:.2f}")
+    print(f"  age:        {telemetry.fix_age_ms}ms")
 
     assert pkt.version == 1
     assert pkt.packet_type == 1
@@ -33,6 +35,9 @@ def assert_default_fake_packet() -> None:
     assert telemetry.temperature_c == 24.5
     assert telemetry.fix_type == 3
     assert telemetry.satellites == 8
+    assert telemetry.payload_version == 2
+    assert telemetry.altitude_m == 11.0
+    assert telemetry.hdop == 0.9
 
 
 def assert_custom_demo_packet() -> None:
@@ -43,6 +48,11 @@ def assert_custom_demo_packet() -> None:
         temperature_c=26.2,
         fix_type=3,
         satellites=10,
+        altitude_m=31.5,
+        hdop=1.25,
+        speed_mps=2.4,
+        course_deg=270.1,
+        fix_age_ms=330,
         timestamp=24,
     )
     pkt = decode_packet(raw)
@@ -54,6 +64,24 @@ def assert_custom_demo_packet() -> None:
     assert telemetry.longitude == -121.7654321
     assert telemetry.temperature_c == 26.2
     assert telemetry.satellites == 10
+    assert telemetry.altitude_m == 31.5
+    assert telemetry.hdop == 1.25
+    assert telemetry.speed_mps == 2.4
+    assert telemetry.course_deg == 270.1
+    assert telemetry.fix_age_ms == 330
+
+
+def assert_legacy_telemetry_payload() -> None:
+    import struct
+
+    payload = struct.pack(">iihBB", 378715000, -1222730000, 245, 3, 8)
+    telemetry = parse_telemetry_payload(payload)
+
+    assert telemetry.payload_version == 1
+    assert telemetry.latitude == 37.8715
+    assert telemetry.longitude == -122.273
+    assert telemetry.altitude_m == 0.0
+    assert telemetry.hdop == 0.0
 
 
 def assert_diagnostic_packet() -> None:
@@ -117,6 +145,7 @@ def assert_command_and_ack_packets() -> None:
 def main():
     assert_default_fake_packet()
     assert_custom_demo_packet()
+    assert_legacy_telemetry_payload()
     assert_diagnostic_packet()
     assert_command_and_ack_packets()
 

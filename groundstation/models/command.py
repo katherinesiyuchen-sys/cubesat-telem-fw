@@ -18,6 +18,7 @@ COMMAND_OPCODE_ISOLATE = 8
 COMMAND_OPCODE_CONNECT = 9
 COMMAND_OPCODE_ARM = 10
 COMMAND_OPCODE_SET_TRANSPORT = 11
+COMMAND_OPCODE_SET_CADENCE = 12
 
 COMMAND_ACK_STATUS_OK = 0
 COMMAND_ACK_STATUS_REJECTED = 1
@@ -67,13 +68,17 @@ COMMAND_NAME_TO_OPCODE = {
     "transport": COMMAND_OPCODE_SET_TRANSPORT,
     "set-transport": COMMAND_OPCODE_SET_TRANSPORT,
     "link": COMMAND_OPCODE_SET_TRANSPORT,
+    "cadence": COMMAND_OPCODE_SET_CADENCE,
+    "set-cadence": COMMAND_OPCODE_SET_CADENCE,
+    "rate": COMMAND_OPCODE_SET_CADENCE,
+    "interval": COMMAND_OPCODE_SET_CADENCE,
 }
 
 OPCODE_TO_COMMAND_NAME = {
     value: key
     for key, value in COMMAND_NAME_TO_OPCODE.items()
     if key not in {"diag", "diagnostic", "telemetry", "status", "rotate-session"}
-    and key not in {"set-transport", "link"}
+    and key not in {"set-transport", "link", "set-cadence", "rate", "interval"}
 }
 
 ACK_STATUS_NAME = {

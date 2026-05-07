@@ -179,35 +179,65 @@ static int test_replay_protection(void) {
 static int test_gnss_parser(void) {
     gnss_fix_t fix;
 
-    const char *valid_gga = "$GNGGA,123519,3748.2900,N,12216.3800,W,1,08,0.9,10.0,M,0.0,M,,*47";
+    const char *valid_gga = "$GNGGA,123519,3748.2900,N,12216.3800,W,1,08,0.9,10.0,M,0.0,M,,*4D";
     if (gnss_parse_sentence(valid_gga, &fix) != ESP_OK || !fix.valid) {
         printf("FAIL: GNSS parser rejected valid GGA\n");
         return 1;
     }
 
-    if (fix.latitude_e7 != 378048333 || fix.longitude_e7 != -1222730000 || fix.satellites != 8) {
+    if (fix.latitude_e7 != 378048333 ||
+        fix.longitude_e7 != -1222730000 ||
+        fix.satellites != 8 ||
+        fix.hdop_x100 != 90 ||
+        fix.altitude_m_x10 != 100 ||
+        (fix.source_flags & GNSS_FIX_FLAG_CHECKSUM) == 0) {
         printf(
-            "FAIL: GNSS parser produced unexpected fix: lat=%ld lon=%ld sats=%u\n",
+            "FAIL: GNSS parser produced unexpected GGA fix: lat=%ld lon=%ld sats=%u hdop=%u alt=%ld flags=0x%02X\n",
             (long)fix.latitude_e7,
             (long)fix.longitude_e7,
-            (unsigned)fix.satellites
+            (unsigned)fix.satellites,
+            (unsigned)fix.hdop_x100,
+            (long)fix.altitude_m_x10,
+            (unsigned)fix.source_flags
         );
         return 1;
     }
 
-    const char *no_fix_gga = "$GNGGA,123519,3748.2900,N,12216.3800,W,0,00,0.9,10.0,M,0.0,M,,*47";
+    const char *bad_checksum_gga = "$GNGGA,123519,3748.2900,N,12216.3800,W,1,08,0.9,10.0,M,0.0,M,,*00";
+    if (gnss_parse_sentence(bad_checksum_gga, &fix) != ESP_ERR_INVALID_CRC) {
+        printf("FAIL: GNSS parser accepted bad checksum GGA\n");
+        return 1;
+    }
+
+    const char *no_fix_gga = "$GNGGA,123519,3748.2900,N,12216.3800,W,0,00,0.9,10.0,M,0.0,M,,*44";
     if (gnss_parse_sentence(no_fix_gga, &fix) == ESP_OK) {
         printf("FAIL: GNSS parser accepted no-fix GGA\n");
         return 1;
     }
 
-    const char *valid_rmc = "$GNRMC,123519,A,3748.2900,N,12216.3800,W,0.0,0.0,010126,,,A*68";
+    const char *valid_rmc = "$GNRMC,123519,A,3748.2900,N,12216.3800,W,12.5,270.1,010126,,,A*49";
     if (gnss_parse_sentence(valid_rmc, &fix) != ESP_OK || !fix.valid) {
         printf("FAIL: GNSS parser rejected valid RMC\n");
         return 1;
     }
 
-    const char *no_fix_rmc = "$GNRMC,123519,V,3748.2900,N,12216.3800,W,0.0,0.0,010126,,,N*68";
+    if (fix.speed_mps_x100 != 643 ||
+        fix.course_deg_x100 != 27010 ||
+        fix.utc_time_ms != 45319000 ||
+        fix.utc_date_ddmmyy != 10126 ||
+        (fix.source_flags & GNSS_FIX_FLAG_RMC) == 0) {
+        printf(
+            "FAIL: GNSS parser produced unexpected RMC fix: speed=%u course=%u time=%lu date=%lu flags=0x%02X\n",
+            (unsigned)fix.speed_mps_x100,
+            (unsigned)fix.course_deg_x100,
+            (unsigned long)fix.utc_time_ms,
+            (unsigned long)fix.utc_date_ddmmyy,
+            (unsigned)fix.source_flags
+        );
+        return 1;
+    }
+
+    const char *no_fix_rmc = "$GNRMC,123519,V,3748.2900,N,12216.3800,W,0.0,0.0,010126,,,N*63";
     if (gnss_parse_sentence(no_fix_rmc, &fix) == ESP_OK) {
         printf("FAIL: GNSS parser accepted no-fix RMC\n");
         return 1;

@@ -43,6 +43,7 @@ static bool opcode_is_valid(uint8_t opcode) {
         case COMMAND_OPCODE_CONNECT:
         case COMMAND_OPCODE_ARM:
         case COMMAND_OPCODE_SET_TRANSPORT:
+        case COMMAND_OPCODE_SET_CADENCE:
             return true;
         default:
             return false;
@@ -263,6 +264,8 @@ const char *command_protocol_opcode_name(uint8_t opcode) {
             return "arm";
         case COMMAND_OPCODE_SET_TRANSPORT:
             return "set-transport";
+        case COMMAND_OPCODE_SET_CADENCE:
+            return "set-cadence";
         default:
             return "unknown";
     }

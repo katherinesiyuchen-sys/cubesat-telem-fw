@@ -26,7 +26,9 @@ def main():
             f"counter={packet.counter} "
             f"lat={telemetry.latitude:.5f} "
             f"lon={telemetry.longitude:.5f} "
-            f"sats={telemetry.satellites}"
+            f"sats={telemetry.satellites} "
+            f"hdop={telemetry.hdop:.2f} "
+            f"age={telemetry.fix_age_ms}ms"
         )
 
         time.sleep(0.5)

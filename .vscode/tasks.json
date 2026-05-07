@@ -1,0 +1,127 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "ESP-IDF: build firmware",
+            "type": "shell",
+            "command": "powershell",
+            "args": [
+                "-ExecutionPolicy",
+                "Bypass",
+                "-NoProfile",
+                "-Command",
+                ". 'C:\\esp\\v6.0.1\\esp-idf\\export.ps1'; idf.py build"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}/firmware"
+            },
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": "$gcc"
+        },
+        {
+            "label": "ESP-IDF: menuconfig",
+            "type": "shell",
+            "command": "powershell",
+            "args": [
+                "-ExecutionPolicy",
+                "Bypass",
+                "-NoProfile",
+                "-Command",
+                ". 'C:\\esp\\v6.0.1\\esp-idf\\export.ps1'; idf.py menuconfig"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}/firmware"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "ESP-IDF: flash and monitor",
+            "type": "shell",
+            "command": "powershell",
+            "args": [
+                "-ExecutionPolicy",
+                "Bypass",
+                "-NoProfile",
+                "-Command",
+                ". 'C:\\esp\\v6.0.1\\esp-idf\\export.ps1'; idf.py -p ${input:espPort} flash monitor"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}/firmware"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "ESP-IDF: monitor",
+            "type": "shell",
+            "command": "powershell",
+            "args": [
+                "-ExecutionPolicy",
+                "Bypass",
+                "-NoProfile",
+                "-Command",
+                ". 'C:\\esp\\v6.0.1\\esp-idf\\export.ps1'; idf.py -p ${input:espPort} monitor"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}/firmware"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "ESP-IDF: fullclean",
+            "type": "shell",
+            "command": "powershell",
+            "args": [
+                "-ExecutionPolicy",
+                "Bypass",
+                "-NoProfile",
+                "-Command",
+                ". 'C:\\esp\\v6.0.1\\esp-idf\\export.ps1'; idf.py fullclean"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}/firmware"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Groundstation: run simulator",
+            "type": "shell",
+            "command": "powershell",
+            "args": [
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                "${workspaceFolder}\\deploy\\run_mastercontrol_sim.ps1"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Groundstation: list serial ports",
+            "type": "shell",
+            "command": "powershell",
+            "args": [
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                "${workspaceFolder}\\deploy\\list_serial_ports.ps1"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": []
+        }
+    ],
+    "inputs": [
+        {
+            "id": "espPort",
+            "type": "promptString",
+            "description": "ESP32 serial port",
+            "default": "COM6"
+        }
+    ]
+}

@@ -37,7 +37,7 @@ Copy-Item -LiteralPath (Join-Path $RepoRoot "firmware\docs\rangepi_bridge.md") -
 Copy-Item -LiteralPath (Join-Path $RepoRoot "firmware\docs\security.md") -Destination $firmwareDocs
 
 Get-ChildItem -LiteralPath $PackageRoot -Directory -Recurse -Force |
-    Where-Object { $_.Name -in @("__pycache__", "map_cache") } |
+    Where-Object { $_.Name -in @("__pycache__", "map_cache", "exports", "state") } |
     Remove-Item -Recurse -Force
 
 Get-ChildItem -LiteralPath $PackageRoot -File -Recurse -Force |

@@ -14,6 +14,9 @@ typedef struct {
     uint8_t lora_coding_rate;
     int8_t lora_tx_power_dbm;
     uint32_t gnss_baudrate;
+    uint8_t transport_mode;
+    uint8_t cadence_mode;
+    uint8_t reserved[2];
     uint32_t boot_count;
 } cubesat_runtime_config_t;
 

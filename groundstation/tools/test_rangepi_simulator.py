@@ -49,6 +49,8 @@ def main() -> None:
         telemetry = parse_telemetry_payload(telemetry_packet.payload)
         assert telemetry_packet.packet_type == HOPE_PACKET_TYPE_TELEMETRY
         assert telemetry.satellites == 9
+        assert telemetry.payload_version == 2
+        assert telemetry.hdop > 0
 
         _write_command(link, 41, COMMAND_OPCODE_SELF_TEST)
         selftest_ack = link.read_line()

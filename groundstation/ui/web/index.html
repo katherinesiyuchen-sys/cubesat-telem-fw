@@ -1,0 +1,425 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>CubeSat Master Control</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+    <link rel="stylesheet" href="/app.css">
+  </head>
+  <body>
+    <div class="shell">
+      <header class="topbar">
+        <div class="identity">
+          <div class="product">CUBESAT</div>
+          <div>
+            <div class="section-label">Master Control</div>
+            <div class="subline">secure node operations / LoRa + Wi-Fi packet control / Bay Area fixed-site constellation</div>
+          </div>
+        </div>
+        <div class="top-actions">
+          <div class="pill ok" id="modePill">SIM-LINK</div>
+          <div class="pill" id="routePill">ROUTE</div>
+          <button data-command="ping">Ping</button>
+          <button data-command="selftest">Selftest</button>
+          <button data-command="replay" data-arm="true" class="danger">Inject Replay</button>
+        </div>
+      </header>
+
+      <aside class="rail">
+        <button class="rail-btn active" data-view="theater">Theater</button>
+        <button class="rail-btn" data-view="overview">Overview</button>
+        <button class="rail-btn" data-view="mission">Mission</button>
+        <button class="rail-btn" data-view="terminal">Terminal</button>
+        <button class="rail-btn" data-view="crypto">RX Crypto</button>
+        <button class="rail-btn" data-view="rf">RF Link</button>
+        <button class="rail-btn" data-view="operations">Operations</button>
+        <button class="rail-btn" data-view="fleet">Fleet</button>
+        <button class="rail-btn" data-view="bringup">Bring-Up</button>
+      </aside>
+
+      <main class="workspace">
+        <section class="view active" id="view-theater">
+          <div class="layout-theater">
+            <section class="theater-stage">
+              <canvas id="theaterCanvas"></canvas>
+              <div class="theater-hud theater-hud-left">
+                <div class="theater-kicker">Mission Theater</div>
+                <div class="theater-title" id="theaterTitle">SF-MISSION</div>
+                <div class="theater-sub" id="theaterSub">live packet choreography / RF links / readiness overlay</div>
+              </div>
+              <div class="theater-hud theater-hud-right">
+                <div class="theater-stat"><span>Frames</span><strong id="theaterFrames">0</strong></div>
+                <div class="theater-stat"><span>Health</span><strong id="theaterHealth">0%</strong></div>
+                <div class="theater-stat"><span>Link</span><strong id="theaterLink">0%</strong></div>
+                <div class="theater-stat"><span>Risk</span><strong id="theaterRisk">0%</strong></div>
+              </div>
+              <div class="theater-controls">
+                <button data-command="tx ping">Ping</button>
+                <button data-command="tx selftest">Selftest</button>
+                <button data-command="tx rotate" data-arm="true">Rotate</button>
+                <button data-command="view mission">Mission</button>
+              </div>
+            </section>
+            <aside class="theater-side">
+              <section class="panel theater-card">
+                <div class="panel-title">Selected Node</div>
+                <div id="theaterNodeCard"></div>
+              </section>
+              <section class="panel theater-card">
+                <div class="panel-title">Command Spotlight</div>
+                <div id="theaterCommandSpotlight"></div>
+              </section>
+              <section class="panel theater-card">
+                <div class="panel-title">Recent Events</div>
+                <div class="theater-events" id="theaterEvents"></div>
+              </section>
+            </aside>
+          </div>
+        </section>
+
+        <section class="view" id="view-overview">
+          <div class="layout-overview">
+            <section class="panel fleet-panel">
+              <div class="panel-title">Fleet Windows</div>
+              <div class="node-list" id="nodeList"></div>
+            </section>
+
+            <section class="panel map-panel">
+              <div class="panel-title map-title">
+                <span>Operational Map</span>
+                <span class="hint">real tile layer / node hover / double-click focus</span>
+              </div>
+              <div class="map-wrap">
+                <div id="realMap"></div>
+                <canvas id="mapCanvas" class="fallback-map"></canvas>
+                <div class="map-tools">
+                  <button id="mapFocus">Focus</button>
+                  <button id="mapReset">Reset</button>
+                  <button id="mapLayer">Street</button>
+                </div>
+                <div class="map-hud">
+                  <div id="mapSelected">SF-MISSION</div>
+                  <div id="mapCoords">lat/lon pending</div>
+                </div>
+              </div>
+            </section>
+
+            <aside class="panel inspector-panel">
+              <div class="panel-title">Node Inspector</div>
+              <div id="inspector"></div>
+            </aside>
+
+            <section class="panel stats-panel">
+              <div class="panel-title">Connection State</div>
+              <div class="metric-grid">
+                <div class="metric"><span>Accepted Frames</span><strong id="acceptedFrames">0</strong></div>
+                <div class="metric"><span>Replay Rejects</span><strong id="replayRejects">0</strong></div>
+                <div class="metric"><span>Average Link</span><strong id="avgLink">0%</strong></div>
+                <div class="metric"><span>Fleet Health</span><strong id="avgHealth">0%</strong></div>
+                <div class="metric"><span>Lattice Risk</span><strong id="avgRisk">0%</strong></div>
+                <div class="metric"><span>Open Alerts</span><strong id="openAlerts">0</strong></div>
+              </div>
+              <div class="donut-row">
+                <canvas class="donut" id="donutHealth"></canvas>
+                <canvas class="donut" id="donutLink"></canvas>
+                <canvas class="donut" id="donutRisk"></canvas>
+              </div>
+            </section>
+
+            <section class="panel analytics-panel">
+              <div class="panel-title">
+                <span>Adaptive Telemetry Analytics</span>
+                <span class="chart-controls">
+                  <button id="graphZoomOut">−</button>
+                  <span id="graphWindow">96 samples</span>
+                  <button id="graphZoomIn">+</button>
+                </span>
+              </div>
+              <div class="overview-chart-grid">
+                <canvas id="chartLink"></canvas>
+                <canvas id="chartRisk"></canvas>
+                <canvas id="chartInterval"></canvas>
+                <canvas id="chartAnomaly"></canvas>
+              </div>
+            </section>
+
+            <section class="panel control-panel">
+              <div class="panel-title">Control Operations</div>
+              <div class="button-grid compact">
+                <button data-command="classify">Classify</button>
+                <button data-command="cadence auto">Auto Cadence</button>
+                <button data-command="cadence fast">Fast Cadence</button>
+                <button data-command="cadence slow">Slow Cadence</button>
+                <button data-command="downlink">Downlink</button>
+                <button data-command="rotate">Rotate</button>
+              </div>
+              <div class="terminal-output compact-terminal" id="terminalOutputMain"></div>
+              <form class="terminal-input compact-input" id="commandFormMain">
+                <span id="promptLabelMain">master[SELECTED]&gt;</span>
+                <input id="commandInputMain" autocomplete="off" spellcheck="false" placeholder="classify">
+              </form>
+            </section>
+
+            <section class="panel scheduler-panel">
+              <div class="panel-title">Adaptive Downlink Scheduler</div>
+              <div class="scheduler-list" id="schedulerList"></div>
+            </section>
+
+            <section class="panel alert-panel">
+              <div class="panel-title">Alert Stream</div>
+              <div class="scroll-list" id="alertList"></div>
+            </section>
+          </div>
+        </section>
+
+        <section class="view" id="view-mission">
+          <div class="layout-mission">
+            <section class="panel timeline-panel">
+              <div class="panel-title">Incident Timeline</div>
+              <div class="timeline-list" id="incidentTimeline"></div>
+              <pre id="timelineDetail" class="timeline-detail"></pre>
+            </section>
+            <section class="panel flow-panel">
+              <div class="panel-title">Packet Flow Diagram</div>
+              <div class="flow-strip" id="packetFlow"></div>
+            </section>
+            <section class="panel waterfall-panel">
+              <div class="panel-title">
+                <span>Live Packet Waterfall</span>
+                <span class="waterfall-legend">
+                  <i class="telemetry"></i> TEL
+                  <i class="ack"></i> ACK
+                  <i class="diagnostic"></i> DIAG
+                  <i class="command"></i> CMD
+                </span>
+              </div>
+              <canvas id="packetWaterfall"></canvas>
+            </section>
+            <section class="panel composer-panel">
+              <div class="panel-title">Command Composer</div>
+              <form id="commandComposer" class="composer-form">
+                <label>Target<select id="composerTarget"></select></label>
+                <label>Command<select id="composerCommand">
+                  <option value="tx ping">Ping</option>
+                  <option value="tx selftest">Selftest</option>
+                  <option value="tx telemetry">Telemetry Now</option>
+                  <option value="cadence">Set Cadence</option>
+                  <option value="transport">Set Transport</option>
+                  <option value="tx rotate">Rotate Session</option>
+                  <option value="tx downlink">Open Downlink</option>
+                  <option value="tx isolate">Isolate</option>
+                  <option value="tx connect">Connect</option>
+                </select></label>
+                <label>Argument<select id="composerArg">
+                  <option value="">none</option>
+                  <option value="auto">auto</option>
+                  <option value="fast">fast</option>
+                  <option value="normal">normal</option>
+                  <option value="slow">slow</option>
+                  <option value="lora">lora</option>
+                  <option value="wifi">wifi</option>
+                </select></label>
+                <label>Auth<select id="composerAuth">
+                  <option value="session">session authenticated</option>
+                  <option value="demo">demo unsigned</option>
+                </select></label>
+                <button id="composerTransmit">Transmit Command</button>
+              </form>
+              <pre id="composerPreview"></pre>
+            </section>
+          </div>
+        </section>
+
+        <section class="view" id="view-terminal">
+          <div class="layout-terminal">
+            <section class="panel terminal-full-panel">
+              <div class="panel-title">Master Terminal</div>
+              <div class="terminal-output terminal-full-output" id="terminalOutputFull"></div>
+              <form class="terminal-input" id="commandFormFull">
+                <span id="promptLabelFull">master[SELECTED]&gt;</span>
+                <input id="commandInputFull" autocomplete="off" spellcheck="false" placeholder="help">
+              </form>
+            </section>
+            <section class="panel terminal-help-panel">
+              <div class="panel-title">Command Palette</div>
+              <div class="button-grid">
+                <button data-command="help">Help</button>
+                <button data-command="status">Status</button>
+                <button data-command="nodes">Nodes</button>
+                <button data-command="classify">Classify</button>
+                <button data-command="tx ping">TX Ping</button>
+                <button data-command="tx selftest">TX Selftest</button>
+                <button data-command="rx latest">RX Latest</button>
+                <button data-command="view rf">Open RF Link</button>
+                <button data-command="queue">ACK Queue</button>
+                <button data-command="record">Recorder</button>
+                <button data-command="view crypto">Open RX Crypto</button>
+                <button data-command="cadence auto">Cadence Auto</button>
+                <button data-command="cadence fast">Cadence Fast</button>
+                <button data-command="cadence slow">Cadence Slow</button>
+                <button data-command="replay" data-arm="true" class="danger">Inject Replay</button>
+                <button data-command="pair kem">Pair KEM</button>
+                <button data-command="transport auto">Transport Auto</button>
+                <button data-command="export all">Export All</button>
+                <button data-command="clear">Clear</button>
+              </div>
+            </section>
+          </div>
+        </section>
+
+        <section class="view" id="view-crypto">
+          <div class="layout-crypto">
+            <section class="panel crypto-list-panel">
+              <div class="panel-title">Encrypted Receive Stream</div>
+              <div class="crypto-table" id="cryptoTable"></div>
+            </section>
+            <section class="panel crypto-detail-panel">
+              <div class="panel-title">Frame Detail</div>
+              <pre id="cryptoDetail"></pre>
+            </section>
+            <section class="panel security-panel">
+              <div class="panel-title">Secure Packet Lifecycle</div>
+              <div class="check-list compact-list" id="securityLifecycle"></div>
+            </section>
+          </div>
+        </section>
+
+        <section class="view" id="view-rf">
+          <div class="layout-rf">
+            <section class="panel rf-health-panel">
+              <div class="panel-title">RangePi RF Health</div>
+              <div class="metric-grid rf-grid" id="rfHealthGrid"></div>
+              <canvas id="rfPacketChart"></canvas>
+            </section>
+            <section class="panel rf-lines-panel">
+              <div class="panel-title">Serial RX/TX Lines</div>
+              <div class="scroll-table raw-line-table" id="rfRawLines"></div>
+            </section>
+            <section class="panel recorder-panel">
+              <div class="panel-title">Mission Recorder</div>
+              <pre id="recorderStatus"></pre>
+            </section>
+          </div>
+        </section>
+
+        <section class="view" id="view-operations">
+          <div class="layout-operations">
+            <section class="panel terminal-panel">
+              <div class="panel-title">Master Terminal</div>
+              <div class="terminal-output" id="terminalOutput"></div>
+              <form class="terminal-input" id="commandForm">
+                <span id="promptLabel">master[SELECTED]&gt;</span>
+                <input id="commandInput" autocomplete="off" spellcheck="false" placeholder="help">
+              </form>
+            </section>
+
+            <section class="panel op-side">
+              <div class="panel-title">Command Control</div>
+              <div class="button-grid">
+                <button data-command="use all">Use All</button>
+                <button data-command="use selected">Use Selected</button>
+                <button data-command="transport lora">LoRa</button>
+                <button data-command="transport wifi">Wi-Fi</button>
+                <button data-command="transport auto">Auto</button>
+                <button data-command="downlink">Downlink</button>
+                <button data-command="rotate" data-arm="true">Rotate Session</button>
+                <button data-command="export all">Export All</button>
+              </div>
+              <div class="command-health" id="commandHealth"></div>
+              <div class="panel-title small">Queue</div>
+              <div class="scroll-table" id="commandTable"></div>
+            </section>
+
+            <section class="panel packet-panel">
+              <div class="panel-title">Packet Feed</div>
+              <div class="scroll-table" id="packetTable"></div>
+            </section>
+          </div>
+        </section>
+
+        <section class="view" id="view-fleet">
+          <div class="layout-fleet">
+            <section class="panel fleet-table-panel">
+              <div class="panel-title">Fleet Registry</div>
+              <div class="fleet-table" id="fleetTable"></div>
+            </section>
+            <section class="panel charts-panel">
+              <div class="panel-title">Node Telemetry Charts</div>
+              <div class="chart-grid">
+                <canvas id="chartFleetLink"></canvas>
+                <canvas id="chartFleetTemp"></canvas>
+                <canvas id="chartFleetRisk"></canvas>
+                <canvas id="chartFleetPackets"></canvas>
+              </div>
+            </section>
+            <section class="panel node-admin">
+              <div class="panel-title">Node Administration</div>
+              <form id="addNodeForm" class="admin-form">
+                <label>Name<input id="addNodeName" placeholder="TEST-NODE"></label>
+                <label>Role<input id="addNodeRole" placeholder="sensor-node"></label>
+                <label>Latitude<input id="addNodeLat" inputmode="decimal" placeholder="37.7749"></label>
+                <label>Longitude<input id="addNodeLon" inputmode="decimal" placeholder="-122.4194"></label>
+                <label>Radio ID<input id="addNodeRadio" inputmode="numeric" placeholder="7"></label>
+                <label>Session<input id="addNodeSession" placeholder="0x12345678"></label>
+                <button>Stage ESP32 Node</button>
+              </form>
+              <div class="button-grid">
+                <button data-command="pair kem">Pair KEM</button>
+                <button data-command="pair pin">Pair PIN</button>
+                <button data-command="isolate" data-arm="true" class="danger">Isolate</button>
+                <button data-command="connect">Connect</button>
+                <button data-command="save">Save Registry</button>
+                <button id="deleteSelected" class="danger">Delete Selected</button>
+              </div>
+              <div class="admin-note">
+                Node ID must match the ESP32 `CubeSat node ID` and the RangePi source ID. Pairing rotates the session once the board is online.
+              </div>
+            </section>
+          </div>
+        </section>
+
+        <section class="view" id="view-bringup">
+          <div class="layout-bringup">
+            <section class="panel bringup-panel">
+              <div class="panel-title">Hardware Bring-Up Checklist</div>
+              <div class="readiness-card" id="readinessCard">
+                <div>
+                  <span>Flight Readiness</span>
+                  <strong id="readinessScore">--%</strong>
+                </div>
+                <canvas id="readinessGauge"></canvas>
+              </div>
+              <div class="check-list" id="bringupList"></div>
+            </section>
+            <section class="panel summary-panel">
+              <div class="panel-title">Mission Summary</div>
+              <div class="button-grid compact">
+                <button data-command="rf">RF Status</button>
+                <button data-command="tx ping">Packet Ping</button>
+                <button data-command="tx selftest">Selftest Packet</button>
+                <button data-command="rx latest">Latest RX</button>
+                <button data-command="record">Recorder Path</button>
+                <button data-command="queue">ACK Queue</button>
+              </div>
+              <pre id="summaryText"></pre>
+            </section>
+          </div>
+        </section>
+      </main>
+    </div>
+    <aside class="packet-drawer" id="packetDrawer" aria-hidden="true">
+      <div class="packet-drawer-head">
+        <div>
+          <div class="panel-title-text">Packet Decoder</div>
+          <div class="packet-drawer-sub" id="packetDrawerSub">no packet selected</div>
+        </div>
+        <button id="packetDrawerClose">Close</button>
+      </div>
+      <div class="packet-drawer-body" id="packetDrawerBody"></div>
+    </aside>
+    <div id="toastHost"></div>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="/app.js"></script>
+  </body>
+</html>

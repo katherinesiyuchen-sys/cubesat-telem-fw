@@ -21,7 +21,12 @@ ESP32 Wi-Fi UDP <-> CubeSat Master Control
 - ESP-IDF firmware builds for `esp32` with ESP-IDF 6.0.1.
 - SX1262 LoRa packet path is implemented.
 - GNSS NMEA parsing and bench fallback telemetry are implemented.
+- GNSS v2 telemetry validates NMEA checksums and carries fix age, altitude, HDOP, speed, course, UTC time, and source flags.
 - Python dashboard can run with simulator, RangePi serial, or Wi-Fi UDP.
+- Revamped browser-based CubeSat Master Control is the default simulator UI.
+- The original Tk dashboard remains available with `deploy\run_mastercontrol_sim.ps1 -Classic`.
+- Dashboard nodes can be added, paired, saved, reloaded, audited, and exported.
+- A hardware bring-up panel checks firmware build output, registry state, links, GNSS quality, command queue, replay guard, and PQ backend readiness.
 - Replay filtering rejects stale or duplicate packet counters.
 - Command packets, ACKs, diagnostics, telemetry, and lattice handshake fragments use the same HOPE packet framing.
 - Wi-Fi UDP backup can be toggled from the app terminal.
@@ -48,9 +53,13 @@ groundstation/
   tools/                        receiver, viewer, tests, install helpers
 
 deploy/
+  esp_build.ps1                activates ESP-IDF and builds firmware
+  esp_flash_monitor.ps1        flashes ESP32 and opens monitor
+  esp_menuconfig.ps1           opens ESP-IDF pin/runtime configuration
   install_groundstation.ps1     creates Python venv and installs deps
   list_serial_ports.ps1         lists COM ports
   run_mastercontrol_sim.ps1     dashboard with built-in simulator
+  run_mastercontrol_web.ps1     browser-based Master Control launcher
   run_mastercontrol_rangepi.ps1 dashboard with RangePi serial bridge
   run_mastercontrol_wifi.ps1    dashboard with ESP32 Wi-Fi UDP backup
   run_rangepi_viewer.ps1        raw RangePi serial/static viewer
@@ -101,6 +110,19 @@ Run the dashboard with no hardware:
 powershell -ExecutionPolicy Bypass -File deploy\run_mastercontrol_sim.ps1
 ```
 
+That opens the newer local web UI at `http://127.0.0.1:8765/`. To keep the
+server running without opening a browser:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File deploy\run_mastercontrol_sim.ps1 -NoBrowser
+```
+
+To run the older Tk UI:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File deploy\run_mastercontrol_sim.ps1 -Classic
+```
+
 Run the RangePi raw viewer:
 
 ```powershell
@@ -128,6 +150,15 @@ Open an ESP-IDF PowerShell. If `idf.py` is not on PATH, activate it manually:
 
 ```powershell
 . C:\esp\v6.0.1\esp-idf\export.ps1
+```
+
+The helper scripts do the same activation automatically when ESP-IDF is in the
+default installer path:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File deploy\esp_menuconfig.ps1 -Target esp32
+powershell -ExecutionPolicy Bypass -File deploy\esp_build.ps1 -Target esp32
+powershell -ExecutionPolicy Bypass -File deploy\esp_flash_monitor.ps1 -Port COM6 -Target esp32
 ```
 
 Build and flash:
@@ -216,6 +247,30 @@ CubeSat security -> Require lattice-derived command authentication
 ```
 
 For first bring-up, keep bench telemetry enabled and command auth optional.
+
+## GNSS
+
+The firmware expects a UART NMEA GNSS module. It accepts talker variants ending
+in:
+
+```text
+RMC: $GNRMC, $GPRMC, ...
+GGA: $GNGGA, $GPGGA, ...
+```
+
+GNSS behavior:
+
+- Validates NMEA checksums when a `*XX` checksum is present.
+- Rejects no-fix RMC/GGA sentences.
+- Preserves empty NMEA fields while parsing.
+- Merges RMC and GGA into one latest fix cache.
+- Uses RMC for UTC date/time, speed, and course.
+- Uses GGA for fix quality, satellites, HDOP, and altitude.
+- Treats cached fixes older than about 5 seconds as stale.
+- Emits bench telemetry if GNSS times out and bench fallback is enabled.
+
+The dashboard shows GNSS satellites, fix age, HDOP, altitude, speed, and course.
+It raises alerts for stale fixes, high HDOP, or low satellite count.
 
 ## Transport Modes
 
@@ -358,6 +413,9 @@ Link and status:
 | `transport wifi` | switch firmware and app route to Wi-Fi UDP |
 | `transport auto` | LoRa primary with Wi-Fi fallback |
 | `rangepi <raw-cmd>` | send raw text to RangePi serial bridge |
+| `bringup` | open the hardware bring-up checklist |
+| `save` | persist dashboard node registry to `groundstation/state/nodes.json` |
+| `export all` | export nodes, command queue, packets, audit log, and summary |
 
 Operational commands:
 
@@ -384,6 +442,18 @@ Node management and pairing:
 | `pair pin` | pair selected node using PIN-style demo state |
 | `pair manual` | pair selected node manually |
 | `pairwizard` | open add/pair dialog |
+
+Persistence and export:
+
+| Command | Meaning |
+| --- | --- |
+| `save` | save the current node registry |
+| `export nodes` | write node registry JSON to `groundstation/exports` |
+| `export commands` | write command queue CSV |
+| `export packets` | write packet log CSV |
+| `export audit` | write audit log CSV |
+| `export summary` | write mission summary JSON |
+| `export all` | write every export type |
 
 Map and environment:
 
@@ -493,6 +563,13 @@ Command opcodes:
 Replay protection is strictly increasing counters per session. Counter `0`,
 duplicates, and stale counters are rejected.
 
+Telemetry payloads are backward-compatible:
+
+| Payload | Size | Fields |
+| --- | --- | --- |
+| v1 | 12 bytes | latitude, longitude, temperature, fix type, satellites |
+| v2 | 36 bytes | v1 fields plus altitude, HDOP, speed, course, GNSS flags, fix age, UTC time, UTC date |
+
 ## Post-Quantum Setup
 
 PC-side optional PQ install:
@@ -537,12 +614,27 @@ cd C:\Users\alexa\cubeSat_firmware\firmware
 idf.py build
 ```
 
+VS Code task equivalents:
+
+```text
+Terminal -> Run Task -> ESP-IDF: build firmware
+Terminal -> Run Task -> ESP-IDF: menuconfig
+Terminal -> Run Task -> ESP-IDF: flash and monitor
+Terminal -> Run Task -> ESP-IDF: monitor
+Terminal -> Run Task -> ESP-IDF: fullclean
+Terminal -> Run Task -> Groundstation: run simulator
+Terminal -> Run Task -> Groundstation: list serial ports
+```
+
 Python checks from repo root:
 
 ```powershell
 $env:PYTHONPATH=(Get-Location).Path
-.venv-groundstation\Scripts\python.exe -m py_compile groundstation\models\command.py groundstation\ui\mastercontrol_app.py groundstation\tools\rangepi_viewer.py
+.venv-groundstation\Scripts\python.exe -m py_compile groundstation\backend\node_registry.py groundstation\models\command.py groundstation\ui\mastercontrol_app.py groundstation\ui\mastercontrol_web.py groundstation\tools\rangepi_viewer.py
+.venv-groundstation\Scripts\python.exe groundstation\tools\test_node_registry.py
 .venv-groundstation\Scripts\python.exe groundstation\tools\test_packet_parser.py
+.venv-groundstation\Scripts\python.exe groundstation\tools\test_rangepi_simulator.py
+.venv-groundstation\Scripts\python.exe groundstation\tools\test_mastercontrol_web.py
 .venv-groundstation\Scripts\python.exe groundstation\tools\test_mastercontrol_smoke.py
 ```
 
