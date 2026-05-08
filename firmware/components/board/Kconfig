@@ -3,62 +3,146 @@ menu "CubeSat board pins"
 config CUBESAT_PIN_STATUS_LED
     int "Status LED GPIO"
     range 0 48
-    default 2
+    default 48
 
 config CUBESAT_PIN_LORA_MOSI
     int "SX1262 MOSI GPIO"
     range 0 48
-    default 23
+    default 11
 
 config CUBESAT_PIN_LORA_MISO
     int "SX1262 MISO GPIO"
     range 0 48
-    default 19
+    default 13
 
 config CUBESAT_PIN_LORA_SCLK
     int "SX1262 SCLK GPIO"
     range 0 48
-    default 18
+    default 12
 
 config CUBESAT_PIN_LORA_CS
     int "SX1262 CS/NSS GPIO"
     range 0 48
-    default 5
+    default 42
 
 config CUBESAT_PIN_LORA_RESET
     int "SX1262 RESET GPIO"
     range 0 48
-    default 14
+    default 2
 
 config CUBESAT_PIN_LORA_BUSY
     int "SX1262 BUSY GPIO"
     range 0 48
-    default 27
+    default 38
 
 config CUBESAT_PIN_LORA_DIO1
     int "SX1262 DIO1 GPIO"
     range 0 48
-    default 26
+    default 39
 
 config CUBESAT_PIN_GNSS_TX
     int "ESP32 TX GPIO to GNSS RX"
     range 0 48
-    default 17
+    default 7
 
 config CUBESAT_PIN_GNSS_RX
     int "ESP32 RX GPIO from GNSS TX"
     range 0 48
-    default 16
+    default 15
 
 config CUBESAT_PIN_I2C_SDA
     int "I2C SDA GPIO"
     range 0 48
-    default 21
+    default 4
 
 config CUBESAT_PIN_I2C_SCL
     int "I2C SCL GPIO"
     range 0 48
-    default 22
+    default 5
+
+config CUBESAT_PIN_LORA_ENABLE
+    int "SX1262 enable GPIO"
+    range -1 48
+    default 40
+
+config CUBESAT_PIN_SENSORS_ENABLE
+    int "Shared sensors enable GPIO"
+    range -1 48
+    default 21
+
+config CUBESAT_PIN_IMU_CS
+    int "IMU chip-select GPIO"
+    range -1 48
+    default 45
+
+config CUBESAT_PIN_IMU_INTERRUPT
+    int "IMU interrupt GPIO"
+    range -1 48
+    default 3
+
+config CUBESAT_PIN_IMU_RESET
+    int "IMU reset GPIO"
+    range -1 48
+    default 9
+
+config CUBESAT_PIN_IMU_WAKE
+    int "IMU wake GPIO"
+    range -1 48
+    default 46
+
+config CUBESAT_PIN_GNSS_EXTINT
+    int "GNSS EXTINT GPIO"
+    range -1 48
+    default 6
+
+config CUBESAT_PIN_RTC_INT
+    int "RTC interrupt GPIO"
+    range -1 48
+    default 1
+
+config CUBESAT_PIN_SOLAR_IRRADIANCE
+    int "Solar irradiance analog/digital GPIO"
+    range -1 48
+    default 47
+
+config CUBESAT_PIN_USBC_ENABLE
+    int "USB-C power enable GPIO"
+    range -1 48
+    default 14
+
+config CUBESAT_PIN_FLASH_CS
+    int "External flash chip-select GPIO"
+    range -1 48
+    default 8
+
+config CUBESAT_PIN_GNSS_EN
+    int "GNSS enable GPIO"
+    range -1 48
+    default 44
+    help
+        MAX-M10S GNSS rail enable/control line.
+
+config CUBESAT_PIN_GNSS_RESET
+    int "GNSS reset GPIO"
+    range -1 48
+    default 43
+    help
+        MAX-M10S reset line.
+
+config CUBESAT_MCP23017_I2C_ADDR
+    hex "MCP23017 pin extender I2C address"
+    range 0x20 0x27
+    default 0x20
+
+config CUBESAT_PIN_MCP23017_INTA
+    int "MCP23017 INTA GPIO"
+    range -1 48
+    default -1
+
+config CUBESAT_PIN_MCP23017_INTB
+    int "MCP23017 INTB GPIO"
+    range -1 48
+    default -1
 
 config CUBESAT_NODE_ID
     int "CubeSat node ID"

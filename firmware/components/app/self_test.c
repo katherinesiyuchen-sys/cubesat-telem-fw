@@ -18,11 +18,12 @@
 #define I2C_SELF_TEST_CLOCK_HZ 100000
 #define I2C_PROBE_TIMEOUT_MS 20
 #define GNSS_SELF_TEST_FIX_TIMEOUT_MS 250
-#define SELF_TEST_LORA_TX_TIMEOUT_MS 5000
+#define SELF_TEST_LORA_TX_TIMEOUT_MS 800
 
 static const char *TAG = "self_test";
 
 static const uint8_t I2C_PROBE_ADDRESSES[] = {
+    0x20, // MCP23017 GPIO expander
     0x1E, // magnetometer class devices
     0x40, // INA/voltage monitor class devices
     0x48, // temperature/ADC class devices

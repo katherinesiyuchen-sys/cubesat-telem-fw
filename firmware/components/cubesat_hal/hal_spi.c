@@ -21,19 +21,23 @@ esp_err_t hal_spi_bus_init(const hal_spi_bus_config_t *config) {
     return err;
 }
 
-esp_err_t hal_spi_add_device(spi_host_device_t host, gpio_num_t cs_pin, int clock_hz, spi_device_handle_t *out) {
+esp_err_t hal_spi_add_device_with_mode(spi_host_device_t host, gpio_num_t cs_pin, int clock_hz, uint8_t spi_mode, spi_device_handle_t *out) {
     if (out == NULL || clock_hz <= 0) {
         return ESP_ERR_INVALID_ARG;
     }
 
     spi_device_interface_config_t dev_cfg = {
         .clock_speed_hz = clock_hz,
-        .mode = 0,
+        .mode = spi_mode,
         .spics_io_num = cs_pin,
         .queue_size = 1,
     };
 
     return spi_bus_add_device(host, &dev_cfg, out);
+}
+
+esp_err_t hal_spi_add_device(spi_host_device_t host, gpio_num_t cs_pin, int clock_hz, spi_device_handle_t *out) {
+    return hal_spi_add_device_with_mode(host, cs_pin, clock_hz, 0, out);
 }
 
 esp_err_t hal_spi_transfer(spi_device_handle_t device, const uint8_t *tx, uint8_t *rx, size_t len) {

@@ -1,82 +1,190 @@
 #pragma once
 
-// ESP32 DevKit-friendly defaults. Replace these with the actual PCB pins before
-// hardware tests. Preferred path: run `idf.py menuconfig` and edit
-// "CubeSat board pins"; the CONFIG_* values below will override these defaults.
+// Board-level pin map. The defaults below now track the custom ESP32-S3 PCB
+// shown in the project schematic, with direct GPIO assignments for the radio,
+// GNSS UART, and shared I2C bus. Signals that live behind the MCP23017 pin
+// extender are given separate logical identifiers further down in this file.
 
 #include "sdkconfig.h"
 
 #ifdef CONFIG_CUBESAT_PIN_STATUS_LED
 #define PIN_STATUS_LED       CONFIG_CUBESAT_PIN_STATUS_LED
 #else
-#define PIN_STATUS_LED       2
+#define PIN_STATUS_LED       48
 #endif
 
 #ifdef CONFIG_CUBESAT_PIN_LORA_MOSI
 #define PIN_LORA_MOSI        CONFIG_CUBESAT_PIN_LORA_MOSI
 #else
-#define PIN_LORA_MOSI        23
+#define PIN_LORA_MOSI        11
 #endif
 
 #ifdef CONFIG_CUBESAT_PIN_LORA_MISO
 #define PIN_LORA_MISO        CONFIG_CUBESAT_PIN_LORA_MISO
 #else
-#define PIN_LORA_MISO        19
+#define PIN_LORA_MISO        13
 #endif
 
 #ifdef CONFIG_CUBESAT_PIN_LORA_SCLK
 #define PIN_LORA_SCLK        CONFIG_CUBESAT_PIN_LORA_SCLK
 #else
-#define PIN_LORA_SCLK        18
+#define PIN_LORA_SCLK        12
 #endif
 
 #ifdef CONFIG_CUBESAT_PIN_LORA_CS
 #define PIN_LORA_CS          CONFIG_CUBESAT_PIN_LORA_CS
 #else
-#define PIN_LORA_CS          5
+#define PIN_LORA_CS          42
 #endif
 
 #ifdef CONFIG_CUBESAT_PIN_LORA_RESET
 #define PIN_LORA_RESET       CONFIG_CUBESAT_PIN_LORA_RESET
 #else
-#define PIN_LORA_RESET       14
+#define PIN_LORA_RESET       2
 #endif
 
 #ifdef CONFIG_CUBESAT_PIN_LORA_BUSY
 #define PIN_LORA_BUSY        CONFIG_CUBESAT_PIN_LORA_BUSY
 #else
-#define PIN_LORA_BUSY        27
+#define PIN_LORA_BUSY        38
 #endif
 
 #ifdef CONFIG_CUBESAT_PIN_LORA_DIO1
 #define PIN_LORA_DIO1        CONFIG_CUBESAT_PIN_LORA_DIO1
 #else
-#define PIN_LORA_DIO1        26
+#define PIN_LORA_DIO1        39
 #endif
 
 #ifdef CONFIG_CUBESAT_PIN_GNSS_TX
 #define PIN_GNSS_TX          CONFIG_CUBESAT_PIN_GNSS_TX
 #else
-#define PIN_GNSS_TX          17
+#define PIN_GNSS_TX          7
 #endif
 
 #ifdef CONFIG_CUBESAT_PIN_GNSS_RX
 #define PIN_GNSS_RX          CONFIG_CUBESAT_PIN_GNSS_RX
 #else
-#define PIN_GNSS_RX          16
+#define PIN_GNSS_RX          15
 #endif
 
 #ifdef CONFIG_CUBESAT_PIN_I2C_SDA
 #define PIN_I2C_SDA          CONFIG_CUBESAT_PIN_I2C_SDA
 #else
-#define PIN_I2C_SDA          21
+#define PIN_I2C_SDA          4
 #endif
 
 #ifdef CONFIG_CUBESAT_PIN_I2C_SCL
 #define PIN_I2C_SCL          CONFIG_CUBESAT_PIN_I2C_SCL
 #else
-#define PIN_I2C_SCL          22
+#define PIN_I2C_SCL          5
 #endif
+
+#ifdef CONFIG_CUBESAT_PIN_LORA_ENABLE
+#define PIN_LORA_ENABLE      CONFIG_CUBESAT_PIN_LORA_ENABLE
+#else
+#define PIN_LORA_ENABLE      40
+#endif
+
+#ifdef CONFIG_CUBESAT_PIN_SENSORS_ENABLE
+#define PIN_SENSORS_ENABLE   CONFIG_CUBESAT_PIN_SENSORS_ENABLE
+#else
+#define PIN_SENSORS_ENABLE   21
+#endif
+
+#ifdef CONFIG_CUBESAT_PIN_IMU_CS
+#define PIN_IMU_CS           CONFIG_CUBESAT_PIN_IMU_CS
+#else
+#define PIN_IMU_CS           45
+#endif
+
+#ifdef CONFIG_CUBESAT_PIN_IMU_INTERRUPT
+#define PIN_IMU_INTERRUPT    CONFIG_CUBESAT_PIN_IMU_INTERRUPT
+#else
+#define PIN_IMU_INTERRUPT    3
+#endif
+
+#ifdef CONFIG_CUBESAT_PIN_IMU_RESET
+#define PIN_IMU_RESET        CONFIG_CUBESAT_PIN_IMU_RESET
+#else
+#define PIN_IMU_RESET        9
+#endif
+
+#ifdef CONFIG_CUBESAT_PIN_IMU_WAKE
+#define PIN_IMU_WAKE         CONFIG_CUBESAT_PIN_IMU_WAKE
+#else
+#define PIN_IMU_WAKE         46
+#endif
+
+#ifdef CONFIG_CUBESAT_PIN_GNSS_EXTINT
+#define PIN_GNSS_EXTINT      CONFIG_CUBESAT_PIN_GNSS_EXTINT
+#else
+#define PIN_GNSS_EXTINT      6
+#endif
+
+#ifdef CONFIG_CUBESAT_PIN_RTC_INT
+#define PIN_RTC_INT          CONFIG_CUBESAT_PIN_RTC_INT
+#else
+#define PIN_RTC_INT          1
+#endif
+
+#ifdef CONFIG_CUBESAT_PIN_SOLAR_IRRADIANCE
+#define PIN_SOLAR_IRRADIANCE CONFIG_CUBESAT_PIN_SOLAR_IRRADIANCE
+#else
+#define PIN_SOLAR_IRRADIANCE 47
+#endif
+
+#ifdef CONFIG_CUBESAT_PIN_USBC_ENABLE
+#define PIN_USBC_ENABLE      CONFIG_CUBESAT_PIN_USBC_ENABLE
+#else
+#define PIN_USBC_ENABLE      14
+#endif
+
+#ifdef CONFIG_CUBESAT_PIN_FLASH_CS
+#define PIN_FLASH_CS         CONFIG_CUBESAT_PIN_FLASH_CS
+#else
+#define PIN_FLASH_CS         8
+#endif
+
+#ifdef CONFIG_CUBESAT_PIN_GNSS_EN
+#define PIN_GNSS_EN          CONFIG_CUBESAT_PIN_GNSS_EN
+#else
+#define PIN_GNSS_EN          44
+#endif
+
+#ifdef CONFIG_CUBESAT_PIN_GNSS_RESET
+#define PIN_GNSS_RESET       CONFIG_CUBESAT_PIN_GNSS_RESET
+#else
+#define PIN_GNSS_RESET       43
+#endif
+
+// MCP23017-E/SO pin extender on the main I2C bus.
+#ifdef CONFIG_CUBESAT_MCP23017_I2C_ADDR
+#define CUBESAT_MCP23017_I2C_ADDR CONFIG_CUBESAT_MCP23017_I2C_ADDR
+#else
+#define CUBESAT_MCP23017_I2C_ADDR 0x20
+#endif
+
+#ifdef CONFIG_CUBESAT_PIN_MCP23017_INTA
+#define PIN_MCP23017_INTA    CONFIG_CUBESAT_PIN_MCP23017_INTA
+#else
+#define PIN_MCP23017_INTA    -1
+#endif
+
+#ifdef CONFIG_CUBESAT_PIN_MCP23017_INTB
+#define PIN_MCP23017_INTB    CONFIG_CUBESAT_PIN_MCP23017_INTB
+#else
+#define PIN_MCP23017_INTB    -1
+#endif
+
+#define MCP23017_PORTA_BASE  0
+#define MCP23017_PORTB_BASE  8
+
+#define MCP23017_PIN_BATTERY_ALERT   (MCP23017_PORTB_BASE + 0)
+#define MCP23017_PIN_MAG_DRDY        (MCP23017_PORTB_BASE + 1)
+#define MCP23017_PIN_POWER_ALERT     (MCP23017_PORTB_BASE + 2)
+#define MCP23017_PIN_TEMP_ALERT      (MCP23017_PORTB_BASE + 3)
+#define MCP23017_PIN_SOLAR_ALERT     (MCP23017_PORTB_BASE + 4)
+#define MCP23017_PIN_USB_POWER_ALERT (MCP23017_PORTB_BASE + 5)
 
 #ifdef CONFIG_CUBESAT_NODE_ID
 #define CUBESAT_NODE_ID              CONFIG_CUBESAT_NODE_ID

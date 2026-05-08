@@ -26,3 +26,5 @@ typedef struct {
 esp_err_t lora_init(const lora_config_t *config);
 esp_err_t lora_send(const uint8_t *payload, size_t len, uint32_t timeout_ms);
 esp_err_t lora_receive(uint8_t *payload, size_t capacity, size_t *out_len, uint32_t timeout_ms);
+void lora_log_debug_snapshot(const char *context);
+void lora_log_debug_changes(const char *context);

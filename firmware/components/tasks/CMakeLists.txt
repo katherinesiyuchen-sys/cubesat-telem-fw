@@ -6,5 +6,5 @@ idf_component_register(
         "lora_task.c"
         "sensor_task.c"
     INCLUDE_DIRS "include"
-    REQUIRES app board comms drivers security storage utils esp_timer
+    REQUIRES app board comms cubesat_hal drivers security storage utils esp_timer freertos
 )

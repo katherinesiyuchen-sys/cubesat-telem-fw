@@ -1,5 +1,9 @@
 {
     "idf.currentSetup": "C:\\esp\\v6.0.1\\esp-idf",
     "C_Cpp.default.compileCommands": "${workspaceFolder}/firmware/build/compile_commands.json",
-    "C_Cpp.default.cStandard": "gnu23"
+    "C_Cpp.default.cStandard": "gnu23",
+    "idf.openOcdConfigs": [
+        "board/esp32s3-builtin.cfg"
+    ],
+    "idf.portWin": "COM6"
 }

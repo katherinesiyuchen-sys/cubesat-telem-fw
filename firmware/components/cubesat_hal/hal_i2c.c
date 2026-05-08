@@ -3,7 +3,7 @@
 #include <limits.h>
 #include <stdbool.h>
 
-#define HAL_I2C_MAX_DEVICES 16
+#define HAL_I2C_MAX_DEVICES 32
 #define HAL_I2C_DEFAULT_GLITCH_IGNORE 7
 
 typedef struct {
@@ -93,6 +93,42 @@ esp_err_t hal_i2c_master_init(const hal_i2c_config_t *config) {
 
     s_config = *config;
     s_device_count = 0;
+    return ESP_OK;
+}
+
+esp_err_t hal_i2c_master_deinit(void) {
+    if (s_bus == NULL) {
+        return ESP_OK;
+    }
+
+    esp_err_t first_error = ESP_OK;
+    for (size_t i = 0; i < s_device_count; ++i) {
+        esp_err_t err = i2c_master_bus_rm_device(s_devices[i].handle);
+        if (err != ESP_OK && first_error == ESP_OK) {
+            first_error = err;
+        }
+        s_devices[i].address = 0;
+        s_devices[i].handle = NULL;
+    }
+    s_device_count = 0;
+
+    esp_err_t err = i2c_del_master_bus(s_bus);
+    if (err != ESP_OK && first_error == ESP_OK) {
+        first_error = err;
+    }
+    s_bus = NULL;
+    return first_error;
+}
+
+esp_err_t hal_i2c_get_config(hal_i2c_config_t *out_config) {
+    if (out_config == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (s_bus == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    *out_config = s_config;
     return ESP_OK;
 }
 

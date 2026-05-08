@@ -8,12 +8,14 @@
 #include "config_store.h"
 #include "counter_store.h"
 #include "diagnostic_protocol.h"
+#include "data_fusion.h"
 #include "gnss.h"
 #include "lattice_protocol.h"
 #include "lattice_security.h"
 #include "loraq.h"
 #include "packet_codec.h"
 #include "replay.h"
+#include "sensor_task.h"
 #include "self_test.h"
 #include "telemetry_protocol.h"
 #include "session.h"
@@ -40,11 +42,13 @@
 #define LORA_TASK_PRIORITY 5
 #endif
 
-#define LORA_TX_TIMEOUT_MS 5000
+#define LORA_TX_TIMEOUT_MS 1200
+#define LORA_TX_FAILURE_BACKOFF_MS 5000
 #define LORA_RX_POLL_MS 250
 #define GNSS_FIX_TIMEOUT_MS 1000
 #define COMMAND_HISTORY_SLOTS 12
 #define WIFI_CONNECT_TIMEOUT_MS 10000
+#define LORA_SIGNAL_LOG_SLICE_MS 500
 
 #ifndef CUBESAT_NODE_ID
 #define CUBESAT_NODE_ID 1
@@ -635,8 +639,26 @@ static esp_err_t transmit_telemetry_from_fix(const gnss_fix_t *fix, bool bench_f
 
     hope_packet_t pkt;
     uint8_t encoded[HOPE_MAX_PACKET_LEN];
+    int16_t temperature_c_x10 = 0;
+    (void)sensor_task_get_latest_temperature_c_x10(&temperature_c_x10);
+    cubesat_sensor_frame_t sensor_frame = {
+        .gnss = *fix,
+        .temperature_c_x10 = temperature_c_x10,
+    };
+    telemetry_sample_t sample = { 0 };
 
-    esp_err_t build_result = telemetry_protocol_build_from_gnss(fix, &pkt);
+    esp_err_t build_result = data_fusion_build_telemetry_sample(&sensor_frame, &sample);
+    if (build_result == ESP_OK) {
+        sample.altitude_m_x10 = fix->altitude_m_x10;
+        sample.hdop_x100 = fix->hdop_x100;
+        sample.speed_mps_x100 = fix->speed_mps_x100;
+        sample.course_deg_x100 = fix->course_deg_x100;
+        sample.fix_age_ms = fix->fix_age_ms;
+        sample.utc_time_ms = fix->utc_time_ms;
+        sample.utc_date_ddmmyy = fix->utc_date_ddmmyy;
+        sample.gnss_flags = fix->source_flags;
+        build_result = telemetry_protocol_build(&sample, &pkt);
+    }
     if (build_result != ESP_OK) {
         return build_result;
     }
@@ -664,7 +686,7 @@ static esp_err_t transmit_telemetry_from_fix(const gnss_fix_t *fix, bool bench_f
     app_state_record_tx(pkt.counter);
     ESP_LOGI(
         TAG,
-        "TX telemetry: counter=%lu lat_e7=%ld lon_e7=%ld sats=%u hdop=%.2f age_ms=%lu bytes=%d source=%s",
+        "TX telemetry complete: counter=%lu lat_e7=%ld lon_e7=%ld sats=%u hdop=%.2f age_ms=%lu bytes=%d source=%s",
         (unsigned long)pkt.counter,
         (long)fix->latitude_e7,
         (long)fix->longitude_e7,
@@ -1032,6 +1054,9 @@ static esp_err_t handle_lora_rx_window(bool *telemetry_paused, bool *telemetry_n
     if (rx_result == ESP_ERR_TIMEOUT) {
         return ESP_OK;
     }
+    if (rx_result == ESP_ERR_INVALID_CRC || rx_result == ESP_ERR_NOT_FOUND) {
+        return ESP_OK;
+    }
     if (rx_result != ESP_OK) {
         ESP_LOGW(TAG, "Packet transport RX failed: %s", esp_err_to_name(rx_result));
         return rx_result;
@@ -1041,8 +1066,8 @@ static esp_err_t handle_lora_rx_window(bool *telemetry_paused, bool *telemetry_n
     int decode_result = packet_decode(rx, rx_len, &packet);
     if (decode_result != 0) {
         app_state_record_parse_error();
-        ESP_LOGW(TAG, "Packet transport RX packet decode failed: %d", decode_result);
-        return ESP_ERR_INVALID_RESPONSE;
+        ESP_LOGD(TAG, "Packet transport RX packet decode failed: %d", decode_result);
+        return ESP_OK;
     }
 
     if (packet.type == HOPE_PACKET_TYPE_HANDSHAKE) {
@@ -1060,13 +1085,14 @@ static void wait_for_next_telemetry(uint32_t wait_ms, bool *telemetry_paused, bo
 
     uint32_t elapsed_ms = 0;
     while (elapsed_ms < wait_ms && !*telemetry_now) {
+        lora_log_debug_changes("LoRa idle");
         (void)handle_lora_rx_window(telemetry_paused, telemetry_now);
         if (*telemetry_now) {
             break;
         }
         uint32_t slice_ms = wait_ms - elapsed_ms;
-        if (slice_ms > LORA_RX_POLL_MS) {
-            slice_ms = LORA_RX_POLL_MS;
+        if (slice_ms > LORA_SIGNAL_LOG_SLICE_MS) {
+            slice_ms = LORA_SIGNAL_LOG_SLICE_MS;
         }
         vTaskDelay(pdMS_TO_TICKS(slice_ms));
         elapsed_ms += slice_ms;
@@ -1081,6 +1107,7 @@ static esp_err_t init_lora_transport(const lora_config_t *lora_config) {
     if (lora_init_result == ESP_OK) {
         s_lora_ready = true;
         ESP_LOGI(TAG, "LoRa transport online");
+        lora_log_debug_snapshot("LoRa task init");
     }
     return lora_init_result;
 }
@@ -1206,6 +1233,7 @@ static void lora_task(void *arg) {
     while (1) {
         gnss_fix_t fix;
 
+        lora_log_debug_changes("LoRa loop");
         (void)handle_lora_rx_window(&telemetry_paused, &telemetry_now);
 
         if (telemetry_paused && !telemetry_now) {
@@ -1250,6 +1278,7 @@ static void lora_task(void *arg) {
         }
         if (tx_result != ESP_OK) {
             ESP_LOGE(TAG, "Packet transport TX failed: %s", esp_err_to_name(tx_result));
+            vTaskDelay(pdMS_TO_TICKS(LORA_TX_FAILURE_BACKOFF_MS));
             continue;
         }
 

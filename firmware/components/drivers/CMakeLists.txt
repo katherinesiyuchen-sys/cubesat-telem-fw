@@ -9,5 +9,5 @@ idf_component_register(
         "temp_sensor.c"
         "wifi_udp_transport.c"
     INCLUDE_DIRS "include"
-    REQUIRES esp_driver_gpio esp_driver_spi esp_driver_uart esp_event esp_netif esp_timer esp_wifi lwip nvs_flash
+    REQUIRES board cubesat_hal esp_driver_gpio esp_driver_i2c esp_driver_spi esp_driver_uart esp_event esp_netif esp_timer esp_wifi freertos lwip nvs_flash
 )

@@ -1,5 +1,5 @@
 param(
-    [string]$Target = "esp32",
+    [string]$Target = "esp32s3",
     [string]$IdfExport = ""
 )
 
@@ -7,6 +7,7 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 $FirmwareDir = Join-Path $RepoRoot "firmware"
 $Sdkconfig = Join-Path $FirmwareDir "sdkconfig"
+. (Join-Path $PSScriptRoot "esp_idf_env.ps1")
 
 function Get-CurrentIdfTarget {
     if (-not (Test-Path -LiteralPath $Sdkconfig)) {
@@ -19,25 +20,7 @@ function Get-CurrentIdfTarget {
     return $Line.Matches[0].Groups[1].Value
 }
 
-if (-not $IdfExport) {
-    $Candidates = @(
-        "C:\esp\v6.0.1\esp-idf\export.ps1",
-        "C:\esp\v6.0\esp-idf\export.ps1"
-    )
-    foreach ($Candidate in $Candidates) {
-        if (Test-Path -LiteralPath $Candidate) {
-            $IdfExport = $Candidate
-            break
-        }
-    }
-}
-
-if (-not $IdfExport -or -not (Test-Path -LiteralPath $IdfExport)) {
-    throw "ESP-IDF export.ps1 was not found. Pass -IdfExport C:\esp\v6.0.1\esp-idf\export.ps1"
-}
-
-Write-Host "Activating ESP-IDF: $IdfExport"
-. $IdfExport
+Enable-EspIdfEnvironment -RequestedExportScript $IdfExport | Out-Null
 
 $CurrentTarget = Get-CurrentIdfTarget
 if ($CurrentTarget -ne $Target) {
